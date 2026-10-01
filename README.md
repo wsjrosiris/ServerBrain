@@ -66,7 +66,7 @@ Optionen für `enroll`:
 |---|---|
 | `-ca-file ca.pem` | Eigene CA für das Zertifikat der Zentrale vertrauen |
 | `-cert c.pem -key k.pem` | Client-Zertifikat für mTLS (Server mit `-client-ca` starten) |
-| `-enable-shell` | Remote-PowerShell-Konsole (`shell.run`) auf diesem Server erlauben |
+| `-enable-shell` | Remote-PowerShell (interaktive Konsole und `shell.run`) auf diesem Server erlauben |
 | `-archive-roots "C:\inetpub\logs;D:\Logs"` | Verzeichnisse, in denen `files.archive_old` arbeiten darf |
 
 Die Konfiguration liegt in `C:\ProgramData\ServerBrain\agent.json`. Sie enthält das Agent-Secret, deshalb setzt der Agent die ACLs auf SYSTEM und Administratoren. `sb-agent capabilities` listet die lokal verfügbaren Aktionen.
@@ -82,7 +82,7 @@ Für die Entwicklung läuft der Agent auch unter Linux und meldet dann Metriken 
 | Dienste | Komplette Dienstliste mit Status und Starttyp, Start/Stopp/Neustart per Klick |
 | Event Logs | System/Application, Warnung und höher, inkrementell übertragen, 30 Tage Aufbewahrung |
 | Alerts | Server offline, Disk ≥ 90/95 %, RAM/CPU ≥ 95 %, gestoppte Autostart-Dienste, Fehlerhäufung, jeweils mit **vorgeschlagener Aktion** |
-| Remote PowerShell | Konsole pro Server (`shell.run`), lokal opt-in, standardmäßig nur für Admins, vollständig auditiert |
+| Remote PowerShell | Interaktive, dauerhafte PowerShell-Sitzung auf dem Server, **immer über den Agenten** (siehe unten). Lokal opt-in, standardmäßig nur für Admins, jede Eingabe auditiert |
 | Aktionen | siehe Katalog unten, mit Vorschau der Befehle und Policy-Entscheidung vor der Ausführung |
 | Freigaben | Warteschlange für Aktionen mit Effekt `approve`, Freigeben/Ablehnen/Zurückziehen, optional Vier-Augen-Prinzip |
 | Audit Log | Lückenlose Protokollierung aller sicherheitsrelevanten Ereignisse |
@@ -107,6 +107,27 @@ Für die Entwicklung läuft der Agent auch unter Linux und meldet dann Metriken 
 | `shell.run` | critical | Beliebiges Skript, lokal opt-in |
 
 Neue Aktionen werden in `internal/actions/catalog.go` definiert. Skript-Aktionen brauchen nur den PowerShell-Code, native Aktionen eine Go-Implementierung in `internal/agent/executor.go`.
+
+## Remote-Konsole
+
+Die Konsole verbindet sich **nie direkt** mit einem Server: kein WinRM, kein RDP, keine eingehenden Ports. Jede Eingabe nimmt diesen Weg:
+
+```text
+Browser ──HTTPS──▶ Zentrale ──(Policy, Audit)──▶ Warteschlange
+                                                     │
+          Agent auf dem Server ◀──ausgehender Long-Poll──┘
+                 │
+                 ▼
+   dauerhafte powershell.exe-Sitzung  ──Ausgabe live──▶ Zentrale ──▶ Browser
+```
+
+- **Echte Sitzung.** Der Agent startet pro Sitzung einen PowerShell-Prozess, der Befehle per Dot-Sourcing im selben Scope ausführt. Variablen, Funktionen, importierte Module und das aktuelle Verzeichnis bleiben erhalten. Der Prompt zeigt `PS C:ktueller\pfad>` und wird rot, wenn der letzte Befehl fehlschlug.
+- **Live-Ausgabe.** Der Agent streamt die Ausgabe in kurzen Abständen (≈150 ms) an die Zentrale. Die Konsole holt sie per Long-Poll ab. Eingaben erreichen den Agenten sofort über einen eigenen Long-Poll-Kanal (`GET /api/agent/sessions`).
+- **Kontrolle.** Eine Sitzung zu öffnen wird wie `shell.run` von der Policy geprüft (`allow` öffnet sofort, `approve` braucht eine Admin-Freigabe in **Freigaben**, `block` verweigert). KI-Konten können keine interaktiven Sitzungen öffnen, sie nutzen einzeln geprüfte Aktionen. Nur der Besitzer darf in seine Sitzung schreiben. Jede Eingabe landet mit Verzeichnis im Audit Log (`session.input`).
+- **Lebenszyklus.** „Neu starten“ beendet einen hängenden Befehl, indem die Shell neu gestartet wird. Nach 30 Minuten Inaktivität schließt die Zentrale die Sitzung, maximal 5 Sitzungen pro Agent. Nach einem Reload setzt die Konsole eine offene Sitzung samt Verlauf fort. Sitzungen leben im Speicher: Nach einem Neustart der Zentrale beendet der Agent seine Shells.
+- **Hinweis:** Befehle, die selbst von der Standardeingabe lesen (z. B. eine verschachtelte interaktive `cmd.exe`), sind nicht unterstützt. Interaktive Abfragen wie `Read-Host` schlagen im nicht-interaktiven Modus sofort fehl, statt zu hängen.
+
+Für einzelne, freigabepflichtige Skripte (z. B. von der KI vorgeschlagen) gibt es weiterhin die Aktion `shell.run`.
 
 ## Policy Engine & KI-Modi
 
@@ -146,10 +167,14 @@ Alle Operator-Endpunkte erwarten `Authorization: Bearer <token>`.
 | `POST /api/commands/{id}/approve` · `/reject` | admin | Freigabe |
 | `POST /api/commands/{id}/cancel` | operator | Eigene Anfrage zurückziehen |
 | `GET /api/actions`, `GET /api/ai/tools`, `GET /api/policy` | viewer | Katalog, Tool-Definitionen, aktive Policy |
+| `POST /api/servers/{id}/sessions` | operator* | Konsolen-Sitzung öffnen `{reason}` (*Policy für `shell.run`, Standard: nur Admins) |
+| `GET /api/sessions/{sid}/output?after=N` | Besitzer/admin | Long-Poll auf neue Ausgabe |
+| `POST /api/sessions/{sid}/input` · `/reset` · `DELETE /api/sessions/{sid}` | Besitzer | Befehl senden, Shell neu starten, beenden |
+| `POST /api/sessions/{sid}/approve` · `/reject` | admin | Sitzung freigeben |
 | `GET /api/audit` | admin | Audit Log |
 | `POST /api/enrollment-tokens`, `GET/POST /api/users` | admin | Verwaltung |
 
-Agent-Endpunkte: `POST /api/agent/enroll`, `POST /api/agent/heartbeat`, `GET /api/agent/commands` (Long-Poll), `POST /api/agent/commands/{id}/result`.
+Agent-Endpunkte: `POST /api/agent/enroll`, `POST /api/agent/heartbeat`, `GET /api/agent/commands` (Long-Poll), `POST /api/agent/commands/{id}/result`, `GET /api/agent/sessions` (Long-Poll), `POST /api/agent/sessions/{sid}/output`.
 
 ## Entwicklung
 

@@ -112,6 +112,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	wg.Add(2)
 	go func() { defer wg.Done(); a.heartbeatLoop(ctx) }()
 	go func() { defer wg.Done(); a.commandLoop(ctx) }()
+	if a.cfg.EnableShell {
+		// Interactive console sessions use their own long-poll so typed
+		// commands reach the server immediately, independent of actions.
+		wg.Add(1)
+		go func() { defer wg.Done(); newSessionManager(a).loop(ctx) }()
+	}
 	wg.Wait()
 	return nil
 }
@@ -222,13 +228,21 @@ func (a *Agent) do(ctx context.Context, method, path string, body, out any, auth
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
+		return &statusError{code: resp.StatusCode, msg: fmt.Sprintf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
 }
+
+// statusError is returned for non-2xx responses from the control plane.
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e *statusError) Error() string { return e.msg }
 
 func sleep(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)

@@ -97,3 +97,38 @@ type CommandResult struct {
 	Started  time.Time       `json:"started"`
 	Finished time.Time       `json:"finished"`
 }
+
+// Interactive console sessions. The console never talks to a server
+// directly: the control plane queues SessionOps, the agent picks them up
+// over its outbound long-poll (GET /api/agent/sessions), runs them in a
+// persistent shell process on the server and streams SessionOutput back.
+
+// Session operation types.
+const (
+	SessionOpen  = "open"  // start the shell process
+	SessionInput = "input" // execute Code in the running shell
+	SessionReset = "reset" // kill and restart the shell (e.g. a hung command)
+	SessionClose = "close" // terminate the shell
+)
+
+type SessionOp struct {
+	SessionID string `json:"session_id"`
+	Type      string `json:"type"`
+	Code      string `json:"code,omitempty"`
+}
+
+// Session output kinds.
+const (
+	OutputText   = "output" // stdout/stderr text
+	OutputReady  = "ready"  // the shell finished a command and waits for input
+	OutputClosed = "closed" // the shell process ended
+	OutputError  = "error"  // the session could not be started or failed
+)
+
+type SessionOutput struct {
+	Seq  int    `json:"seq"` // per session, increasing; duplicates are dropped
+	Kind string `json:"kind"`
+	Text string `json:"text,omitempty"`
+	OK   bool   `json:"ok,omitempty"`  // ready: last command succeeded
+	Cwd  string `json:"cwd,omitempty"` // ready: current directory
+}

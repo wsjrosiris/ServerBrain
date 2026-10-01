@@ -123,3 +123,28 @@ pre {
 .notice { background: rgba(47,111,223,.1); border: 1px solid var(--accent); padding: 10px; border-radius: 8px; margin: 8px 0; }
 .decision { margin: 10px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .admin-only[hidden] { display: none; }
+
+/* interactive console */
+.term-head h2 { margin: 0; }
+.spacer { flex: 1; }
+.term {
+  background: var(--code-bg); color: var(--code-text); border-radius: 8px 8px 0 0;
+  padding: 12px; height: 55vh; min-height: 260px; overflow: auto; margin-top: 12px;
+  font: 13px/1.45 ui-monospace, "Cascadia Code", Consolas, monospace; white-space: pre-wrap; word-break: break-word;
+}
+.term-input { color: #9fd0ff; font-weight: 600; }
+.term-status { color: #8a96a8; font-style: italic; }
+.term-error { color: #ff8a8a; }
+.term-row {
+  display: flex; align-items: flex-start; gap: 0; background: var(--code-bg); color: var(--code-text);
+  border-radius: 0 0 8px 8px; padding: 6px 12px 10px; border-top: 1px solid #263042;
+  font: 13px/1.45 ui-monospace, "Cascadia Code", Consolas, monospace; margin-bottom: 6px;
+}
+.term-prompt { color: #7fd99a; white-space: pre; padding-top: 1px; }
+.term-prompt.failed { color: #ff8a8a; }
+.term-row textarea.term-entry {
+  flex: 1; background: transparent; border: none; color: #ffffff; padding: 0; min-height: 0; resize: none;
+  font: inherit; font-weight: 400; outline: none;
+}
+.term-row.busy .term-prompt { opacity: .4; }
+.term-row textarea:disabled { opacity: .5; }

@@ -69,11 +69,13 @@ type Server struct {
 
 	mu      sync.Mutex
 	waiters map[string]chan struct{} // serverID -> wake-up signal for long polls
+
+	sessions *sessionHub
 }
 
 func New(cfg Config, st *store.Store, pol *policy.Policy, log *slog.Logger) *Server {
 	cfg.defaults()
-	return &Server{cfg: cfg, store: st, policy: pol, log: log, waiters: map[string]chan struct{}{}}
+	return &Server{cfg: cfg, store: st, policy: pol, log: log, waiters: map[string]chan struct{}{}, sessions: newSessionHub()}
 }
 
 // Handler returns the HTTP handler for the whole control plane.
@@ -85,6 +87,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/agent/heartbeat", s.agentOnly(s.agentAuth(s.handleHeartbeat)))
 	mux.HandleFunc("GET /api/agent/commands", s.agentOnly(s.agentAuth(s.handlePoll)))
 	mux.HandleFunc("POST /api/agent/commands/{id}/result", s.agentOnly(s.agentAuth(s.handleResult)))
+	mux.HandleFunc("GET /api/agent/sessions", s.agentOnly(s.agentAuth(s.handleAgentSessionPoll)))
+	mux.HandleFunc("POST /api/agent/sessions/{sid}/output", s.agentOnly(s.agentAuth(s.handleAgentSessionOutput)))
 
 	// Operator API.
 	mux.HandleFunc("GET /api/me", s.userAuth(policy.RoleViewer, s.handleMe))
@@ -96,6 +100,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/servers/{id}/events", s.userAuth(policy.RoleViewer, s.handleServerEvents))
 	mux.HandleFunc("POST /api/servers/{id}/actions", s.userAuth(policy.RoleViewer, s.handleRequestAction))
 	mux.HandleFunc("POST /api/servers/{id}/actions/preview", s.userAuth(policy.RoleViewer, s.handlePreviewAction))
+	mux.HandleFunc("POST /api/servers/{id}/sessions", s.userAuth(policy.RoleOperator, s.handleOpenSession))
+	mux.HandleFunc("GET /api/sessions", s.userAuth(policy.RoleOperator, s.handleListSessions))
+	mux.HandleFunc("GET /api/sessions/{sid}/output", s.userAuth(policy.RoleOperator, s.handleSessionOutput))
+	mux.HandleFunc("POST /api/sessions/{sid}/input", s.userAuth(policy.RoleOperator, s.handleSessionInput))
+	mux.HandleFunc("POST /api/sessions/{sid}/reset", s.userAuth(policy.RoleOperator, s.handleSessionReset))
+	mux.HandleFunc("DELETE /api/sessions/{sid}", s.userAuth(policy.RoleOperator, s.handleSessionClose))
+	mux.HandleFunc("POST /api/sessions/{sid}/approve", s.userAuth(policy.RoleAdmin, s.handleSessionDecide(true)))
+	mux.HandleFunc("POST /api/sessions/{sid}/reject", s.userAuth(policy.RoleAdmin, s.handleSessionDecide(false)))
 	mux.HandleFunc("GET /api/events", s.userAuth(policy.RoleViewer, s.handleEvents))
 	mux.HandleFunc("GET /api/alerts", s.userAuth(policy.RoleViewer, s.handleAlerts))
 	mux.HandleFunc("GET /api/actions", s.userAuth(policy.RoleViewer, s.handleCatalog))
@@ -129,6 +141,7 @@ func (s *Server) Run(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		s.maintainSessions(ctx)
 		if n, err := s.store.ExpireStale(ctx, s.cfg.PendingTTL, s.cfg.DispatchTTL); err != nil {
 			s.log.Error("expire commands", "err", err)
 		} else if n > 0 {

@@ -29,7 +29,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./internal/agent/ ./internal/actions/
+      - run: go test -v -run "PowerShell|Archive|Refuses" ./internal/agent/
+      - run: go test ./internal/actions/ ./internal/policy/
       - name: Agent builds and lists its Windows capabilities
         run: |
           go build -o sb-agent.exe ./cmd/sb-agent

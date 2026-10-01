@@ -153,9 +153,11 @@ async function refreshApprovalCount() {
   if (!state.token) return;
   try {
     const list = await api("GET", "/api/commands?status=pending_approval");
+    const sessions = canOperate() ? await api("GET", "/api/sessions?status=pending_approval").catch(() => []) : [];
+    const n = list.length + sessions.length;
     const b = document.getElementById("approval-count");
-    b.textContent = list.length;
-    b.hidden = list.length === 0;
+    b.textContent = n;
+    b.hidden = n === 0;
   } catch (_) { /* ignore */ }
 }
 setInterval(refreshApprovalCount, 15000);
@@ -256,7 +258,7 @@ async function viewServer(id) {
       if (tab === "services") body.replaceChildren(serverServices(server));
       if (tab === "events") body.replaceChildren(await serverEvents(server));
       if (tab === "actions") body.replaceChildren(await serverActions(server));
-      if (tab === "console") body.replaceChildren(serverConsole(server));
+      if (tab === "console") body.replaceChildren(await serverConsole(server));
     } catch (e) { body.replaceChildren(errorBox(e)); }
   }
 
@@ -371,27 +373,136 @@ async function serverActions(s) {
     h("div", { class: "panel" }, h("h2", {}, "Letzte Aktionen"), commandsTable(cmds, false)));
 }
 
-function serverConsole(s) {
+const prompt = (os, cwd) => os === "windows" ? `PS ${cwd || ""}> ` : `${cwd || ""} $ `;
+
+async function serverConsole(s) {
+  const panel = h("div", { class: "panel" });
   if (!(s.capabilities || []).includes("shell.run")) {
-    return h("div", { class: "panel" }, h("h2", {}, "Remote-Konsole"),
+    panel.append(h("h2", {}, "Remote-Konsole"),
       h("p", { class: "muted" }, "Die Konsole ist auf diesem Agenten deaktiviert. Aktivieren mit ",
-        h("code", {}, "sb-agent enroll … -enable-shell"), " bzw. ", h("code", {}, "\"enable_shell\": true"), " in agent.json. Ausführung unterliegt der Policy (standardmäßig nur Admins) und wird vollständig auditiert."));
+        h("code", {}, "sb-agent enroll … -enable-shell"), " bzw. ", h("code", {}, "\"enable_shell\": true"), " in agent.json."));
+    return panel;
   }
-  const script = h("textarea", { placeholder: s.os === "windows" ? "Get-Service W3SVC | Format-List *" : "uname -a", spellcheck: "false" });
-  const reason = h("input", { placeholder: "Grund (für Audit-Log)" });
-  const out = h("div");
-  const run = async () => {
-    if (!script.value.trim()) return;
-    out.replaceChildren(h("div", { class: "muted" }, "Sende…"));
+  // Resume an existing session of mine on this server (transcript is replayed).
+  let existing = null;
+  try {
+    const mine = (await api("GET", "/api/sessions?server=" + s.id)).filter((x) => x.owner === state.me.name);
+    existing = mine.find((x) => ["open", "opening", "pending_approval"].includes(x.status)) || null;
+  } catch (_) { /* viewers have no console */ }
+  if (existing) attachTerminal(panel, s, existing.id);
+  else renderConsoleStart(panel, s);
+  return panel;
+}
+
+function renderConsoleStart(panel, s) {
+  const reason = h("input", { placeholder: "Grund (wird Freigebenden angezeigt und auditiert)" });
+  const err = h("div");
+  const start = async () => {
     try {
-      const res = await api("POST", `/api/servers/${s.id}/actions`, { action: "shell.run", params: { script: script.value }, reason: reason.value });
-      out.replaceChildren(commandResultView(res.command));
-      followCommand(res.command.id, out);
-    } catch (e) { out.replaceChildren(errorBox(e)); }
+      const res = await api("POST", `/api/servers/${s.id}/sessions`, { reason: reason.value });
+      attachTerminal(panel, s, res.session.id);
+      refreshApprovalCount();
+    } catch (e) { err.replaceChildren(errorBox(e)); }
   };
-  script.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) run(); });
-  return h("div", { class: "panel" }, h("h2", {}, (s.os === "windows" ? "PowerShell" : "Shell") + " auf " + s.hostname),
-    script, reason, h("div", { class: "row decision" }, h("button", { class: "primary", onclick: run }, "Ausführen (Strg+Enter)")), out);
+  reason.addEventListener("keydown", (e) => { if (e.key === "Enter") start(); });
+  panel.replaceChildren(
+    h("h2", {}, (s.os === "windows" ? "PowerShell" : "Shell") + "-Sitzung auf " + s.hostname),
+    h("p", { class: "muted" }, "Die Sitzung läuft direkt auf dem Server: Die Konsole spricht nur mit der Zentrale, die Befehle über die ausgehende Verbindung an den ServerBrain-Agenten weiterreicht. Der Agent führt sie in einer dauerhaften " +
+      (s.os === "windows" ? "PowerShell" : "Shell") + " aus – Variablen, Module und das aktuelle Verzeichnis bleiben zwischen Befehlen erhalten. Jede Eingabe wird im Audit-Log protokolliert."),
+    reason, err,
+    h("div", { class: "row decision" }, h("button", { class: "primary", onclick: start }, "Sitzung starten")));
+  reason.focus();
+}
+
+function attachTerminal(panel, s, sid) {
+  const term = h("div", { class: "term", role: "log", "aria-live": "polite" });
+  const promptEl = h("span", { class: "term-prompt" });
+  const input = h("textarea", { class: "term-entry", rows: "1", spellcheck: "false", autocomplete: "off", "aria-label": "Befehl" });
+  const statusEl = h("span", { class: "term-status" });
+  const resetBtn = h("button", { class: "small", title: "Bricht einen hängenden Befehl ab, indem die Shell neu gestartet wird", onclick: async () => {
+    try { await api("POST", `/api/sessions/${sid}/reset`); } catch (e) { line("error", e.message); }
+  } }, "Neu starten");
+  const closeBtn = h("button", { class: "small danger", onclick: async () => {
+    try { await api("DELETE", `/api/sessions/${sid}`); } catch (e) { line("error", e.message); }
+  } }, "Beenden");
+  const inputRow = h("div", { class: "term-row" }, promptEl, input);
+  panel.replaceChildren(
+    h("div", { class: "row term-head" }, h("h2", {}, (s.os === "windows" ? "PowerShell" : "Shell") + " auf " + s.hostname), statusEl, h("span", { class: "spacer" }), resetBtn, closeBtn),
+    term, inputRow,
+    h("div", { class: "muted small" }, "Enter: ausführen · Shift+Enter: neue Zeile · ↑/↓: Verlauf · Ausführung auf dem Server über den ServerBrain-Agenten"));
+
+  let next = 0, cwd = "", busy = true, status = "opening", stopped = false;
+  const history = [];
+  let hpos = 0;
+
+  function line(kind, text) {
+    const atBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 40;
+    term.append(h("div", { class: "term-" + kind }, text));
+    if (atBottom || kind === "input") term.scrollTop = term.scrollHeight;
+  }
+  function render() {
+    const labels = { opening: "verbinde…", open: busy ? "läuft…" : "bereit", pending_approval: "wartet auf Freigabe", closed: "beendet", failed: "fehlgeschlagen", rejected: "abgelehnt" };
+    statusEl.replaceChildren(sev(labels[status] || status, status === "open" ? (busy ? "dispatched" : "succeeded") : status === "pending_approval" ? "pending_approval" : status === "opening" ? "queued" : "failed"));
+    promptEl.textContent = prompt(s.os, cwd);
+    const live = status === "open";
+    input.disabled = !live;
+    resetBtn.disabled = !live;
+    closeBtn.disabled = !["open", "opening", "pending_approval"].includes(status);
+    inputRow.classList.toggle("busy", busy);
+  }
+  function apply(c) {
+    if (c.kind === "input") { line("input", prompt(s.os, c.cwd) + c.text); }
+    else if (c.kind === "output") { line("output", c.text.replace(/\n$/, "")); }
+    else if (c.kind === "ready") { cwd = c.cwd || cwd; busy = false; promptEl.classList.toggle("failed", !c.ok); }
+    else if (c.kind === "status") { line("status", c.text); }
+    else if (c.kind === "error") { line("error", c.text); }
+    else if (c.kind === "closed") { line("status", c.text || "Sitzung beendet"); }
+  }
+  async function pollLoop() {
+    while (!stopped && panel.isConnected && state.token) {
+      try {
+        const res = await api("GET", `/api/sessions/${sid}/output?after=${next}`);
+        if (res.truncated) line("status", "… ältere Ausgabe verworfen …");
+        for (const c of res.chunks) apply(c);
+        next = res.next;
+        status = res.session.status;
+        busy = res.session.busy;
+        if (res.session.cwd) cwd = res.session.cwd;
+        render();
+        if (["closed", "failed", "rejected"].includes(status)) {
+          stopped = true;
+          panel.append(h("div", { class: "row decision" }, h("button", { class: "primary", onclick: () => renderConsoleStart(panel, s) }, "Neue Sitzung")));
+          refreshApprovalCount();
+        }
+        if (status === "open" && !busy && document.activeElement !== input && !term.contains(document.activeElement)) input.focus();
+      } catch (e) {
+        if (e.status === 404 || e.status === 403) { line("error", "Sitzung nicht mehr vorhanden (Zentrale neu gestartet?)"); status = "closed"; render(); stopped = true; return; }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+  }
+  async function send() {
+    const code = input.value;
+    if (!code.trim() && code !== "") return;
+    if (code.trim()) { history.push(code); hpos = history.length; }
+    input.value = "";
+    autosize();
+    busy = true; render();
+    try { await api("POST", `/api/sessions/${sid}/input`, { code }); }
+    catch (e) { line("error", e.message); busy = false; render(); }
+  }
+  function autosize() { input.rows = Math.min(12, Math.max(1, input.value.split("\n").length)); }
+  input.addEventListener("input", autosize);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    else if (e.key === "ArrowUp" && !input.value.includes("\n") && hpos > 0) { e.preventDefault(); input.value = history[--hpos]; autosize(); }
+    else if (e.key === "ArrowDown" && !input.value.includes("\n") && hpos < history.length) { e.preventDefault(); hpos++; input.value = history[hpos] || ""; autosize(); }
+  });
+  term.addEventListener("click", () => { if (!getSelection().toString()) input.focus(); });
+  render();
+  // The panel may not be in the document yet (resumed session); start once it is.
+  const startWhenAttached = (tries) => panel.isConnected ? pollLoop() : tries > 0 && setTimeout(() => startWhenAttached(tries - 1), 50);
+  startWhenAttached(100);
 }
 
 // ---------- actions ----------
@@ -497,7 +608,19 @@ async function viewApprovals() {
   async function load() {
     try {
       const list = await api("GET", "/api/commands?status=pending_approval");
-      box.replaceChildren(...(list.length ? list.map((c) => h("div", { class: "panel" },
+      const sessions = canOperate() ? await api("GET", "/api/sessions?status=pending_approval").catch(() => []) : [];
+      const decide = async (sid, verb) => { try { await api("POST", `/api/sessions/${sid}/${verb}`); load(); refreshApprovalCount(); } catch (e) { alert(e.message); } };
+      const sessionCards = sessions.map((x) => h("div", { class: "panel" },
+        h("div", { class: "decision" }, sev("critical", "critical-risk"), h("strong", {}, "Interaktive Konsolen-Sitzung"), "auf",
+          h("a", { href: "#/servers/" + x.server_id }, x.hostname), h("span", { class: "muted small" }, fmtTime(x.created_at))),
+        h("div", {}, "Angefordert von ", h("strong", {}, x.owner), " · Regel ", h("code", {}, x.policy_rule)),
+        x.reason ? h("div", { class: "notice" }, x.reason) : null,
+        h("p", { class: "muted small" }, "Nach der Freigabe kann " + x.owner + " beliebige Befehle in einer Shell auf dem Server ausführen (über den Agenten, jede Eingabe wird auditiert)."),
+        isAdmin() ? h("div", { class: "row" },
+          h("button", { class: "primary", onclick: () => decide(x.id, "approve") }, "Sitzung freigeben"),
+          h("button", { class: "danger", onclick: () => decide(x.id, "reject") }, "Ablehnen")) : null));
+      if (!list.length && sessionCards.length) { box.replaceChildren(...sessionCards); return; }
+      box.replaceChildren(...sessionCards, ...(list.length ? list.map((c) => h("div", { class: "panel" },
         h("div", { class: "decision" }, sev(c.risk, c.risk === "critical" ? "critical-risk" : c.risk), h("strong", {}, c.action), "auf",
           h("a", { href: "#/servers/" + c.server_id }, c.hostname), h("span", { class: "muted small" }, fmtTime(c.created_at))),
         h("div", {}, "Angefordert von ", h("strong", {}, c.requested_by), c.actor_type === "ai" ? " (KI-Agent)" : "", " · Regel ", h("code", {}, c.policy_rule)),

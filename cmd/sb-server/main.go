@@ -1,0 +1,142 @@
+// Command sb-server runs the ServerBrain control plane.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/wsjrosiris/serverbrain/internal/policy"
+	"github.com/wsjrosiris/serverbrain/internal/server"
+	"github.com/wsjrosiris/serverbrain/internal/store"
+)
+
+func main() {
+	var (
+		addr       = flag.String("addr", ":8443", "listen address")
+		dbPath     = flag.String("db", "serverbrain.db", "SQLite database path")
+		policyFile = flag.String("policy", "", "policy JSON file (default: built-in policy)")
+		certFile   = flag.String("tls-cert", "", "TLS certificate (PEM); without it the server speaks plain HTTP (dev only)")
+		keyFile    = flag.String("tls-key", "", "TLS private key (PEM)")
+		clientCA   = flag.String("client-ca", "", "CA bundle for agent client certificates; enables mTLS on agent endpoints")
+		interval   = flag.Duration("heartbeat", 30*time.Second, "agent heartbeat interval")
+		trustProxy = flag.Bool("trust-proxy", false, "trust X-Forwarded-For for client addresses")
+		newAdmin   = flag.String("create-admin", "", "create an additional admin user with this name, print its token and exit (token recovery)")
+	)
+	flag.Parse()
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	if *newAdmin != "" {
+		if err := createAdmin(*dbPath, *newAdmin); err != nil {
+			log.Error("create admin", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := run(log, *addr, *dbPath, *policyFile, *certFile, *keyFile, *clientCA, *interval, *trustProxy); err != nil {
+		log.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func createAdmin(dbPath, name string) error {
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if _, tok, err := st.CreateUser(ctx, name, policy.RoleAdmin, policy.ActorHuman); err != nil {
+		return fmt.Errorf("user %q could not be created (name taken?): %w", name, err)
+	} else {
+		_ = st.Audit(ctx, "system", "system", "user.created", name, map[string]any{"role": policy.RoleAdmin, "via": "cli"})
+		fmt.Println(tok)
+	}
+	return nil
+}
+
+func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA string, interval time.Duration, trustProxy bool) error {
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	pol := policy.Default()
+	if policyFile != "" {
+		if pol, err = policy.Load(policyFile); err != nil {
+			return err
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if n, err := st.CountUsers(ctx); err != nil {
+		return err
+	} else if n == 0 {
+		_, tok, err := st.CreateUser(ctx, "admin", policy.RoleAdmin, policy.ActorHuman)
+		if err != nil {
+			return err
+		}
+		_ = st.Audit(ctx, "system", "system", "user.bootstrap", "admin", nil)
+		fmt.Fprintf(os.Stderr, "\n  Bootstrap admin created. API token (shown only once):\n\n    %s\n\n", tok)
+	}
+
+	srv := server.New(server.Config{HeartbeatInterval: interval, RequireClientCert: clientCA != "", TrustProxy: trustProxy}, st, pol, log)
+	go srv.Run(ctx)
+
+	hs := &http.Server{
+		Addr:              addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      90 * time.Second, // > long-poll timeout
+		IdleTimeout:       120 * time.Second,
+	}
+	if clientCA != "" {
+		pem, err := os.ReadFile(clientCA)
+		if err != nil {
+			return err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return errors.New("client-ca: no certificates found")
+		}
+		// Browsers don't present certificates, so verification is enforced
+		// per route: agent endpoints require a verified chain.
+		hs.TLSConfig = &tls.Config{ClientCAs: pool, ClientAuth: tls.VerifyClientCertIfGiven, MinVersion: tls.VersionTLS12}
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = hs.Shutdown(shutdown)
+	}()
+
+	if certFile != "" {
+		log.Info("ServerBrain control plane listening (HTTPS)", "addr", addr, "mtls", clientCA != "")
+		err = hs.ListenAndServeTLS(certFile, keyFile)
+	} else {
+		if clientCA != "" {
+			return errors.New("-client-ca requires -tls-cert and -tls-key")
+		}
+		log.Warn("ServerBrain control plane listening on plain HTTP - use -tls-cert/-tls-key in production", "addr", addr)
+		err = hs.ListenAndServe()
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}

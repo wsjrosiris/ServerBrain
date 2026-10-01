@@ -1,0 +1,21 @@
+{
+  "allow_self_approval": false,
+  "rules": [
+    { "name": "viewers-read-only", "roles": ["viewer"], "read_only": false, "effect": "block" },
+    { "name": "domain-controllers-protected", "tags": ["domain-controller"], "read_only": false, "actor_types": ["ai"], "effect": "block" },
+    { "name": "read-only-actions", "read_only": true, "effect": "allow" },
+
+    { "name": "shell-admin-only", "actions": ["shell.run"], "actor_types": ["human"], "roles": ["admin"], "effect": "approve" },
+    { "name": "shell-blocked", "actions": ["shell.run"], "effect": "block" },
+    { "name": "reboot-needs-approval", "actions": ["system.reboot"], "effect": "approve" },
+
+    { "name": "ai-autonomous-on-web", "actor_types": ["ai"], "tags": ["web"],
+      "actions": ["service.restart", "service.start", "iis.apppool.restart", "temp.cleanup"], "effect": "allow" },
+    { "name": "ai-assisted", "actor_types": ["ai"], "effect": "approve" },
+
+    { "name": "humans-low", "actor_types": ["human"], "risks": ["low"], "effect": "allow" },
+    { "name": "humans-medium-high-prod", "actor_types": ["human"], "risks": ["medium", "high"], "tags": ["prod"], "effect": "approve" },
+    { "name": "humans-medium", "actor_types": ["human"], "risks": ["medium"], "effect": "allow" },
+    { "name": "humans-high", "actor_types": ["human"], "risks": ["high"], "effect": "approve" }
+  ]
+}

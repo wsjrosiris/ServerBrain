@@ -1,0 +1,13 @@
+# systemd unit for running the agent on Linux (development / mixed fleets).
+[Unit]
+Description=ServerBrain Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sb-agent run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

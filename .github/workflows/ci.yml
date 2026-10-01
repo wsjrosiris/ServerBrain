@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: make vet
+      - run: make test
+      - run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: serverbrain-binaries
+          path: dist/
+
+  windows-agent:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./internal/agent/ ./internal/actions/
+      - name: Agent builds and lists its Windows capabilities
+        run: |
+          go build -o sb-agent.exe ./cmd/sb-agent
+          ./sb-agent.exe capabilities -config nonexistent.json

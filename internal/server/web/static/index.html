@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ServerBrain</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/">ServerBrain</a>
+  <nav id="nav" hidden>
+    <a href="#/" data-route="overview">Übersicht</a>
+    <a href="#/approvals" data-route="approvals">Freigaben <span id="approval-count" class="badge" hidden></span></a>
+    <a href="#/commands" data-route="commands">Aktionen</a>
+    <a href="#/events" data-route="events">Ereignisse</a>
+    <a href="#/audit" data-route="audit" class="admin-only">Audit</a>
+    <a href="#/settings" data-route="settings">Einstellungen</a>
+  </nav>
+  <div id="whoami" class="whoami"></div>
+</header>
+<main id="app"></main>
+<div id="modal" class="modal" hidden>
+  <div class="modal-body" id="modal-body"></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -177,14 +177,45 @@ Antwort (Diagnose · Belege · Lösung) ──▶ Konsole + Servertagebuch + Obs
   - Riskante Aktionen brauchen laut Policy eine Freigabe, `shell.run` ist für KI gesperrt.
   - Die Begründung der KI wird Freigebenden angezeigt und auditiert.
   - Tool-Ergebnisse gelten als Daten, nicht als Anweisungen.
-- **Modell:** Claude über das offizielle Go-SDK (`claude-opus-5-5`, adaptive Thinking, Effort `high`, serverseitiger Fallback bei Ablehnungen durch Sicherheitsfilter, Prompt-Caching für Systemprompt und Tools).
+- **Modell:** `claude-opus-5-5` mit Effort `high`, wahlweise über das **Claude-Abo** (Claude Code) oder einen **API-Key** (offizielles Go-SDK mit adaptivem Thinking, serverseitigem Fallback bei Ablehnungen und Prompt-Caching). Siehe unten.
+
+### Anbindung: Claude-Abo oder API-Key
+
+ServerBrain unterstützt zwei Backends. Funktionen, Tools, Policy, Freigaben und Audit sind bei beiden identisch.
+
+| | **Claude-Abo** (`-ai-backend claude-code`) | **API-Key** (`-ai-backend api`) |
+|---|---|---|
+| Abrechnung | über dein Claude Pro / Max / Team / Enterprise Abo | nutzungsbasiert über die Claude Console |
+| Technik | Claude Code CLI headless (`claude -p`); ServerBrain stellt seine Tools über einen lokalen MCP-Endpunkt bereit | Anthropic Go-SDK, ServerBrain steuert die Tool-Schleife selbst |
+| Anmeldung | `claude setup-token` (einmalig, Token ~1 Jahr gültig) → `CLAUDE_CODE_OAUTH_TOKEN` | `ANTHROPIC_API_KEY` |
+| Voraussetzung | Claude Code auf dem ServerBrain-Host (`npm install -g @anthropic-ai/claude-code`) | – |
+
+**Mit Abo:**
+
+```bash
+claude setup-token                       # einmalig, im Browser mit deinem Claude-Konto anmelden
+export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+sb-server ... -ai-model claude-opus-5-5 -ai-effort high
+# -ai-backend auto wählt automatisch Claude Code, sobald CLAUDE_CODE_OAUTH_TOKEN gesetzt ist
+```
+
+So ist Claude Code im Abo-Modus abgesichert:
+- Alle eingebauten Werkzeuge von Claude Code sind abgeschaltet: keine Shell, kein Dateizugriff, kein Web (`--tools ""`).
+- Erlaubt sind nur die ServerBrain-Tools (`--allowedTools "mcp__serverbrain__*"`, `--permission-mode dontAsk`, `--strict-mcp-config`).
+- Der MCP-Endpunkt lauscht nur auf `127.0.0.1` und akzeptiert ein eigenes Token pro Analyse.
+- Ein `ANTHROPIC_API_KEY` in der Umgebung wird an Claude Code **nicht** weitergegeben, damit wirklich das Abo genutzt wird (abschaltbar mit `-claude-subscription=false`).
+- Folgefragen setzen die Claude-Code-Sitzung fort (`--resume`).
+
+> **Nutzungsbedingungen:** Die Abo-Anmeldung ist für deine eigene, interne ServerBrain-Installation gedacht. Anthropic erlaubt Drittanbietern ohne vorherige Genehmigung nicht, claude.ai-Login oder Abo-Kontingente in eigenen Produkten anzubieten. Wer ServerBrain für Kunden betreibt, nutzt API-Keys.
+
+**Mit API-Key:**
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 sb-server ... -ai auto -ai-model claude-opus-5-5 -ai-effort high -ai-auto-analysis=true
 ```
 
-Ohne API-Key bleiben alle anderen Funktionen voll nutzbar (`-ai off` schaltet die KI explizit ab).
+Ohne Anmeldedaten bleiben alle anderen Funktionen voll nutzbar (`-ai off` schaltet die KI explizit ab).
 
 ## Autopilot (Self-Healing)
 
@@ -335,7 +366,7 @@ internal/policy       Policy Engine
 internal/store        SQLite-Persistenz
 internal/server       HTTP-API, Alerts, Sessions, eingebettete Web-Konsole (web/static)
 internal/knowledge    Second Brain: Rollen, Lerner (Tagebuch, Abhängigkeiten, Signale), Obsidian-Vault
-internal/ai           LLM-Anbindung (Claude über das Go-SDK) hinter einem schmalen Interface
+internal/ai           LLM-Anbindung: Claude API (Go-SDK) und Claude Code (Abo) hinter einem schmalen Interface
 internal/agent        Collector (PowerShell/CIM unter Windows), Executor, native Aktionen
 internal/protocol     Wire-Typen Agent ↔ Zentrale
 deploy/               Beispiel-Policy, systemd-Units

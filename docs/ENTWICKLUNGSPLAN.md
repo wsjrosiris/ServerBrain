@@ -163,3 +163,15 @@ Offen und in M3+ eingeplant: Verifikation nach Fixes (A6), Konfigurierbarkeit de
 | Bestätigung | `POST /api/incidents/{id}/execute`, Schritte abwählbar, Ausführung als bestätigende Person über die Policy, Admin-Bestätigung zählt als Freigabe (außer Vier-Augen) |
 | Erfolgsprüfung | Wartet auf frische Agent-Daten und prüft das Symptom (A6 aus dem Brainstorming vorgezogen) |
 | Nachvollziehbarkeit | Tagebuch/Obsidian bei jedem Übergang, Audit `incident.confirmed`, Analyse-Schritte der KI einsehbar |
+
+## 9. KI über das Claude-Abo
+
+Anforderung: Die KI soll auch mit einem Claude-Abo (Pro/Max/Team/Enterprise) funktionieren, nicht nur mit API-Keys.
+
+| Baustein | Umsetzung |
+|---|---|
+| Backend | `ai.ClaudeCode`: startet die Claude Code CLI headless (`claude -p --output-format stream-json`), Anmeldung über `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) oder gespeicherten Login |
+| Tools | Lokaler MCP-Endpunkt (`127.0.0.1`, Token pro Lauf). Dieselben Tools und derselbe Ausführungspfad wie beim API-Backend, also identische Policy, Freigaben, Audit und Live-Schritte. |
+| Absicherung | `--tools ""`, `--allowedTools mcp__serverbrain__*`, `--permission-mode dontAsk`, `--strict-mcp-config`, eigener System-Prompt, leeres Arbeitsverzeichnis; API-Keys werden im Abo-Modus nicht weitergereicht |
+| Auswahl | `-ai-backend auto` nutzt das Abo, sobald `CLAUDE_CODE_OAUTH_TOKEN` gesetzt ist, sonst den API-Key |
+| Tests | Test-Binary als simulierte `claude`-CLI, die echtes MCP spricht und Flags sowie Umgebung prüft |

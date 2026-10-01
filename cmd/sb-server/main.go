@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -38,7 +39,10 @@ func main() {
 		vaultDir   = flag.String("vault", "vault", "Obsidian vault directory for the knowledge base and server diary (empty disables it)")
 		vaultSub   = flag.String("vault-folder", "ServerBrain", "folder inside the vault that ServerBrain manages")
 		timezone   = flag.String("timezone", "Europe/Berlin", "time zone for the server diary")
-		aiMode     = flag.String("ai", "auto", "AI operator: auto (on when ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_PROFILE is set), on, off")
+		aiMode     = flag.String("ai", "auto", "AI operator: auto (on when CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or ANTHROPIC_PROFILE is set), on, off")
+		aiBackend  = flag.String("ai-backend", "auto", "auto, api (Claude API via SDK, API key) or claude-code (Claude Code CLI; works with a Claude Pro/Max/Team subscription)")
+		claudeBin  = flag.String("claude-bin", "claude", "Claude Code CLI for -ai-backend claude-code")
+		claudeSub  = flag.Bool("claude-subscription", true, "claude-code backend: use the subscription login (CLAUDE_CODE_OAUTH_TOKEN or stored /login) and never an API key from the environment")
 		aiModel    = flag.String("ai-model", "claude-opus-5-5", "Claude model for the AI operator")
 		aiEffort   = flag.String("ai-effort", "high", "reasoning effort: low, medium, high, xhigh, max")
 		aiAuto     = flag.Bool("ai-auto-analysis", true, "let the AI analyse critical incidents automatically (read-only)")
@@ -62,7 +66,7 @@ func main() {
 		os.Exit(2)
 	}
 	vault := vaultOptions{dir: *vaultDir, folder: *vaultSub, loc: loc}
-	auto := automationOptions{aiMode: *aiMode, model: *aiModel, effort: *aiEffort, autoAnalysis: *aiAuto, autopilot: *autopilot, grace: *apGrace}
+	auto := automationOptions{aiMode: *aiMode, backend: *aiBackend, claudeBin: *claudeBin, subscription: *claudeSub, model: *aiModel, effort: *aiEffort, autoAnalysis: *aiAuto, autopilot: *autopilot, grace: *apGrace}
 	if err := run(log, *addr, *dbPath, *policyFile, *certFile, *keyFile, *clientCA, *interval, *trustProxy, vault, auto); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
@@ -86,18 +90,51 @@ func createAdmin(dbPath, name string) error {
 }
 
 type automationOptions struct {
-	aiMode, model, effort   string
-	autoAnalysis, autopilot bool
-	grace                   time.Duration
+	aiMode, backend, claudeBin, model, effort string
+	autoAnalysis, autopilot, subscription     bool
+	grace                                     time.Duration
 }
 
-func aiCredentialsPresent() bool {
+func apiCredentialsPresent() bool {
 	for _, k := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"} {
 		if os.Getenv(k) != "" {
 			return true
 		}
 	}
 	return false
+}
+
+// newAIProvider picks the LLM backend. With a subscription token present,
+// auto prefers Claude Code (subscription); otherwise the API via the SDK.
+func newAIProvider(log *slog.Logger, ao automationOptions) ai.Provider {
+	subToken := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != ""
+	if ao.aiMode == "off" || (ao.aiMode == "auto" && !subToken && !apiCredentialsPresent()) {
+		if ao.aiMode == "auto" {
+			log.Info("AI operator disabled: no credentials (Claude subscription: `claude setup-token` → CLAUDE_CODE_OAUTH_TOKEN; or ANTHROPIC_API_KEY)")
+		}
+		return nil
+	}
+	backend := ao.backend
+	if backend == "auto" {
+		backend = "api"
+		if subToken {
+			backend = "claude-code"
+		}
+	}
+	switch backend {
+	case "claude-code":
+		if _, err := exec.LookPath(ao.claudeBin); err != nil {
+			log.Error("Claude Code CLI not found; install it (npm install -g @anthropic-ai/claude-code) or set -claude-bin", "bin", ao.claudeBin)
+		}
+		p := ai.NewClaudeCode(ai.ClaudeCodeConfig{Command: []string{ao.claudeBin}, Model: ao.model, Effort: ao.effort, UseSubscription: ao.subscription})
+		log.Info("AI operator enabled", "backend", "claude-code", "subscription", ao.subscription, "model", ao.model, "effort", ao.effort)
+		return p
+	case "api":
+		log.Info("AI operator enabled", "backend", "api", "model", ao.model, "effort", ao.effort)
+		return ai.NewClaude(ai.ClaudeConfig{Model: ao.model, Effort: ao.effort})
+	}
+	log.Error("unknown -ai-backend", "value", backend)
+	return nil
 }
 
 type vaultOptions struct {
@@ -134,12 +171,8 @@ func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA
 	}
 
 	srv := server.New(server.Config{HeartbeatInterval: interval, RequireClientCert: clientCA != "", TrustProxy: trustProxy, AutoAnalysis: ao.autoAnalysis}, st, pol, log)
-	switch {
-	case ao.aiMode == "on" || (ao.aiMode == "auto" && aiCredentialsPresent()):
-		srv.SetAI(ai.NewClaude(ai.ClaudeConfig{Model: ao.model, Effort: ao.effort}))
-		log.Info("AI operator enabled", "model", ao.model, "effort", ao.effort, "auto_analysis", ao.autoAnalysis)
-	case ao.aiMode == "auto":
-		log.Info("AI operator disabled: no Anthropic credentials (set ANTHROPIC_API_KEY)")
+	if p := newAIProvider(log, ao); p != nil {
+		srv.SetAI(p)
 	}
 	if ao.autopilot {
 		srv.EnableAutopilot(ctx, server.AutopilotConfig{Grace: ao.grace})

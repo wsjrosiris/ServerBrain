@@ -52,8 +52,40 @@ type Conversation interface {
 	Answer(ctx context.Context, results []ToolResult) (*Reply, error)
 }
 
-// Provider creates conversations.
+// Provider is a configured LLM backend. It is either a ConversationProvider
+// (ServerBrain runs the tool loop, e.g. the Claude API) or an AgentRunner
+// (the backend runs the loop itself and calls ServerBrain's tools via MCP,
+// e.g. Claude Code with a Claude subscription).
 type Provider interface {
-	NewConversation(system string, tools []Tool) Conversation
 	Name() string
+}
+
+// ConversationProvider creates conversations driven by ServerBrain.
+type ConversationProvider interface {
+	Provider
+	NewConversation(system string, tools []Tool) Conversation
+}
+
+// AgentRunner runs a complete agent turn on its own. The tools are served
+// to it by ServerBrain's MCP endpoint at MCPURL, authorized by MCPToken.
+type AgentRunner interface {
+	Provider
+	RunAgent(ctx context.Context, req AgentRequest) (*AgentResult, error)
+}
+
+type AgentRequest struct {
+	System    string
+	Prompt    string
+	SessionID string // continue this agent session (follow-up question)
+	MCPURL    string
+	MCPToken  string
+	// OnText receives text the model writes between tool calls.
+	OnText func(text string)
+}
+
+type AgentResult struct {
+	Text      string
+	SessionID string
+	Turns     int
+	CostUSD   float64
 }

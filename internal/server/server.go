@@ -81,13 +81,14 @@ type Server struct {
 
 	ai        ai.Provider // nil when no LLM is configured
 	assistant *assistantHub
+	mcp       *mcpHub
 	autopilot *Autopilot // nil when disabled
 }
 
 func New(cfg Config, st *store.Store, pol *policy.Policy, log *slog.Logger) *Server {
 	cfg.defaults()
 	srv := &Server{cfg: cfg, store: st, policy: pol, log: log, waiters: map[string]chan struct{}{}, sessions: newSessionHub(),
-		learner: knowledge.NewLearner(st, log), assistant: newAssistantHub()}
+		learner: knowledge.NewLearner(st, log), assistant: newAssistantHub(), mcp: &mcpHub{tokens: map[string]*Run{}}}
 	srv.learner.OnSignal = srv.onSignal
 	return srv
 }

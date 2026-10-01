@@ -72,11 +72,12 @@ type Run struct {
 
 	IncidentID string `json:"incident_id,omitempty"`
 
-	steps      []Step
-	notify     chan struct{}
-	conv       ai.Conversation
-	actor      Actor
-	incidentID string
+	steps        []Step
+	notify       chan struct{}
+	conv         ai.Conversation
+	actor        Actor
+	incidentID   string
+	agentSession string // Claude Code session for follow-up questions
 }
 
 type assistantHub struct {
@@ -113,6 +114,14 @@ func (s *Server) setRunStatus(run *Run, status string) {
 	h.mu.Unlock()
 }
 
+// lockedRunView copies a run for JSON while holding the assistant lock.
+func (s *Server) lockedRunView(run *Run) Run {
+	s.assistant.mu.Lock()
+	defer s.assistant.mu.Unlock()
+	return s.runView(run)
+}
+
+// runView copies a run for JSON; the caller holds s.assistant.mu.
 func (s *Server) runView(run *Run) Run {
 	v := *run
 	v.steps, v.notify, v.conv = nil, nil, nil
@@ -150,7 +159,9 @@ func (s *Server) newRun(owner, origin string, actor Actor, srv *store.Server, qu
 	if srv != nil {
 		run.ServerID, run.Hostname = srv.ID, srv.Hostname
 	}
-	run.conv = s.ai.NewConversation(systemPrompt, s.aiTools(run))
+	if cp, ok := s.ai.(ai.ConversationProvider); ok {
+		run.conv = cp.NewConversation(systemPrompt, s.aiTools(run))
+	}
 	s.assistant.mu.Lock()
 	s.assistant.runs[run.ID] = run
 	s.assistant.mu.Unlock()
@@ -174,6 +185,48 @@ func (s *Server) process(run *Run, question string) {
 	prompt := question
 	if run.ServerID != "" && len(run.steps) <= 1 {
 		prompt = fmt.Sprintf("[Kontext: Die Frage bezieht sich auf den Server %s (server_id %s).]\n\n%s", run.Hostname, run.ServerID, question)
+	}
+	var answer string
+	var err error
+	if runner, ok := s.ai.(ai.AgentRunner); ok {
+		answer, err = s.processAgent(ctx, run, runner, prompt)
+	} else {
+		answer, err = s.processConversation(ctx, run, prompt)
+	}
+	s.finishRun(run, question, answer, err)
+}
+
+// processAgent lets an agent backend (Claude Code) run the loop; it calls
+// ServerBrain's tools through the MCP endpoint.
+func (s *Server) processAgent(ctx context.Context, run *Run, runner ai.AgentRunner, prompt string) (string, error) {
+	url, err := s.ensureMCP()
+	if err != nil {
+		return "", err
+	}
+	tok := s.mcpRegister(run)
+	defer s.mcpRevoke(tok)
+	s.assistant.mu.Lock()
+	session := run.agentSession
+	s.assistant.mu.Unlock()
+	res, err := runner.RunAgent(ctx, ai.AgentRequest{
+		System: systemPrompt, Prompt: prompt, SessionID: session, MCPURL: url, MCPToken: tok,
+		OnText: func(text string) { s.addStep(run, Step{Kind: "status", Title: oneLine(text, 300)}) },
+	})
+	if res != nil && res.SessionID != "" {
+		s.assistant.mu.Lock()
+		run.agentSession = res.SessionID
+		s.assistant.mu.Unlock()
+	}
+	if err != nil {
+		return "", err
+	}
+	return res.Text, nil
+}
+
+// processConversation runs the tool loop itself (Claude API).
+func (s *Server) processConversation(ctx context.Context, run *Run, prompt string) (string, error) {
+	if run.conv == nil {
+		return "", fmt.Errorf("KI-Backend unterstützt keine Unterhaltung")
 	}
 	reply, err := run.conv.Ask(ctx, prompt)
 	var answer string
@@ -207,6 +260,10 @@ func (s *Server) process(run *Run, question string) {
 		wg.Wait()
 		reply, err = run.conv.Answer(ctx, results)
 	}
+	return answer, err
+}
+
+func (s *Server) finishRun(run *Run, question, answer string, err error) {
 	if err != nil {
 		s.log.Error("assistant", "run", run.ID, "err", err)
 		s.addStep(run, Step{Kind: "error", Title: "Die KI ist nicht erreichbar", Detail: err.Error()})
@@ -329,7 +386,7 @@ func (s *Server) handleAssistantStart(w http.ResponseWriter, r *http.Request) {
 	}
 	run := s.startRun(u.Name, "user", aiActorFor(u), srv, strings.TrimSpace(body.Question))
 	_ = s.store.Audit(r.Context(), u.Name, u.Kind, "assistant.question", body.ServerID, map[string]any{"run": run.ID, "question": oneLine(body.Question, 500)})
-	writeJSON(w, http.StatusCreated, s.runView(run))
+	writeJSON(w, http.StatusCreated, s.lockedRunView(run))
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) *Run {
@@ -379,7 +436,7 @@ func (s *Server) handleAssistantAsk(w http.ResponseWriter, r *http.Request) {
 	s.assistant.mu.Unlock()
 	_ = s.store.Audit(r.Context(), u.Name, u.Kind, "assistant.question", run.ServerID, map[string]any{"run": run.ID, "question": oneLine(body.Question, 500)})
 	go s.process(run, strings.TrimSpace(body.Question))
-	writeJSON(w, http.StatusAccepted, s.runView(run))
+	writeJSON(w, http.StatusAccepted, s.lockedRunView(run))
 }
 
 // GET /api/assistant/{rid}/steps?after=N  (long-poll)

@@ -59,6 +59,7 @@ const (
 	CatNote         = "notiz"
 	CatAI           = "ki"
 	CatAutopilot    = "autopilot"
+	CatIncident     = "vorfall"
 )
 
 // Journal severities.

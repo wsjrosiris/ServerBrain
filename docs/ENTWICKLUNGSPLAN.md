@@ -13,6 +13,7 @@ Stand: Oktober 2026 · lebendes Dokument, wird mit jedem Meilenstein aktualisier
 | Second Brain: Lerner, Rollen, Abhängigkeiten, Servertagebuch, Obsidian-Vault | ✅ |
 | KI-Operator: Assistent mit Tool Use, Explain & Fix, automatische Incident-Analyse (M1) | ✅ |
 | Autopilot: Self-Healing-Playbooks mit Eskalation (M2) | ✅ |
+| Vorfall-Workflow: Erkennen → Analyse → vorbereitete Lösung → Bestätigung → Erfolgsprüfung (M2b) | ✅ |
 
 Vor M1/M2 fehlte die Schicht, die das Produkt ausmacht: **eine KI, die dieses Wissen nutzt, Probleme erklärt und unter Kontrolle der Policy behebt.** Diese Lücke schließen M1 und M2.
 
@@ -151,3 +152,14 @@ K7 Berichte, K8 Policy-Vorschläge, K9 Runbooks aus dem Tagebuch, A5 eigene Play
 | Tests | Skript-LLM + simulierter Windows-Agent: Diagnose über die Policy, Freigabepflicht, Viewer-Begrenzung, Autopilot-Neustart, Wartungsmodus, Eskalation |
 
 Offen und in M3+ eingeplant: Verifikation nach Fixes (A6), Konfigurierbarkeit der Playbooks (A5), Kosten-Reporting der KI-Nutzung.
+
+## 8. M2b – Vorfall-Workflow (Anforderung: „Fehler automatisch analysieren, Lösung vorbereiten, mit Bestätigung umsetzen“)
+
+| Baustein | Umsetzung |
+|---|---|
+| Erkennung | Lerner-Signale: Dienst gestoppt, Datenträger kritisch, kritisches Ereignis, neues Fehlerbild, Server offline. Erholungs-Signale schließen Vorfälle automatisch. |
+| Vorfall | Tabelle `incidents`, Deduplizierung pro Server und Problem, Korrelation begleitender Symptome (10 min) |
+| Analyse | KI read-only (rate-limitiert, manuell erzwingbar) mit Tool `propose_solution` (validierter Plan aus Katalog-Aktionen, kein `shell.run`); ohne KI Regel-Lösungen |
+| Bestätigung | `POST /api/incidents/{id}/execute`, Schritte abwählbar, Ausführung als bestätigende Person über die Policy, Admin-Bestätigung zählt als Freigabe (außer Vier-Augen) |
+| Erfolgsprüfung | Wartet auf frische Agent-Daten und prüft das Symptom (A6 aus dem Brainstorming vorgezogen) |
+| Nachvollziehbarkeit | Tagebuch/Obsidian bei jedem Übergang, Audit `incident.confirmed`, Analyse-Schritte der KI einsehbar |

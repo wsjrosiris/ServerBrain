@@ -70,10 +70,13 @@ type Run struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Tokens    int64     `json:"tokens"`
 
-	steps  []Step
-	notify chan struct{}
-	conv   ai.Conversation
-	actor  Actor
+	IncidentID string `json:"incident_id,omitempty"`
+
+	steps      []Step
+	notify     chan struct{}
+	conv       ai.Conversation
+	actor      Actor
+	incidentID string
 }
 
 type assistantHub struct {
@@ -129,15 +132,25 @@ func aiActorFor(u *store.User) Actor {
 // autoActor is used for automatic incident analyses: read-only.
 var autoActor = Actor{Name: "KI (automatisch)", Kind: policy.ActorAI, Role: policy.RoleViewer}
 
+// startIncidentRun starts the read-only AI analysis of an incident; the
+// run may additionally call propose_solution.
+func (s *Server) startIncidentRun(srv *store.Server, incidentID, question string) *Run {
+	return s.newRun("ServerBrain", "auto", autoActor, srv, question, incidentID)
+}
+
 // startRun creates a run and processes the first question in the background.
 func (s *Server) startRun(owner, origin string, actor Actor, srv *store.Server, question string) *Run {
+	return s.newRun(owner, origin, actor, srv, question, "")
+}
+
+func (s *Server) newRun(owner, origin string, actor Actor, srv *store.Server, question, incidentID string) *Run {
 	now := time.Now().UTC()
 	run := &Run{ID: store.NewID(), Owner: owner, Origin: origin, Title: oneLine(question, 120), Status: "running",
-		CreatedAt: now, UpdatedAt: now, notify: make(chan struct{}), actor: actor}
+		CreatedAt: now, UpdatedAt: now, notify: make(chan struct{}), actor: actor, incidentID: incidentID, IncidentID: incidentID}
 	if srv != nil {
 		run.ServerID, run.Hostname = srv.ID, srv.Hostname
 	}
-	run.conv = s.ai.NewConversation(systemPrompt, s.aiTools())
+	run.conv = s.ai.NewConversation(systemPrompt, s.aiTools(run))
 	s.assistant.mu.Lock()
 	s.assistant.runs[run.ID] = run
 	s.assistant.mu.Unlock()
@@ -198,10 +211,18 @@ func (s *Server) process(run *Run, question string) {
 		s.log.Error("assistant", "run", run.ID, "err", err)
 		s.addStep(run, Step{Kind: "error", Title: "Die KI ist nicht erreichbar", Detail: err.Error()})
 		s.setRunStatus(run, "error")
+		if run.incidentID != "" {
+			s.finishIncidentAnalysis(run.incidentID, "", err)
+		}
 		return
 	}
 	s.addStep(run, Step{Kind: "answer", Title: "Antwort", Detail: answer, OK: true})
 	s.setRunStatus(run, "done")
+	if run.incidentID != "" {
+		// The incident carries diagnosis and solution into the diary.
+		s.finishIncidentAnalysis(run.incidentID, answer, nil)
+		return
+	}
 	s.journalRun(run, question, answer)
 }
 
@@ -223,7 +244,7 @@ func (s *Server) journalRun(run *Run, question, answer string) {
 }
 
 func (s *Server) runTool(ctx context.Context, run *Run, call ai.ToolCall) ai.ToolResult {
-	t, ok := s.toolByName(call.Name)
+	t, ok := s.toolByName(run, call.Name)
 	if !ok {
 		return ai.ToolResult{CallID: call.ID, Content: "Unbekanntes Tool: " + call.Name, IsError: true}
 	}

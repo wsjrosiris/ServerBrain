@@ -58,29 +58,6 @@ func (s *Server) EnableAutopilot(ctx context.Context, cfg AutopilotConfig) {
 	s.autopilot = &Autopilot{s: s, cfg: cfg, ctx: ctx, attempts: map[string][]time.Time{}, running: map[string]bool{}, pending: map[string]func(){}}
 }
 
-// onSignal dispatches learner signals to the autopilot and the automatic
-// AI analysis. It is called inside heartbeat processing, so all work runs
-// in the background.
-func (s *Server) onSignal(sig knowledge.Signal) {
-	ap := s.autopilot
-	switch sig.Kind {
-	case knowledge.SignalServiceStopped:
-		if ap != nil {
-			ap.spawn(sig.ServerID+"|svc|"+strings.ToLower(sig.Service), func() { ap.restartService(sig) })
-		} else {
-			s.autoAnalyze(sig.ServerID, sig.Title+"\n"+sig.Detail)
-		}
-	case knowledge.SignalDiskCritical:
-		if ap != nil {
-			ap.spawn(sig.ServerID+"|disk|"+sig.Disk, func() { ap.inspectDisk(sig) })
-		} else {
-			s.autoAnalyze(sig.ServerID, sig.Title+"\n"+sig.Detail)
-		}
-	case knowledge.SignalCriticalEvent:
-		s.autoAnalyze(sig.ServerID, sig.Title+"\n"+sig.Detail)
-	}
-}
-
 // spawn runs a playbook in the background, one at a time per key. A signal
 // arriving while the same playbook runs is not lost: it runs right after.
 func (ap *Autopilot) spawn(key string, fn func()) {
@@ -154,13 +131,19 @@ func (ap *Autopilot) restartService(sig knowledge.Signal) {
 	}
 	if hasTag(srv, MaintenanceTag) {
 		ap.note(srv.ID, store.SevInfo, "Autopilot pausiert: "+sig.Service+" nicht neu gestartet", "Der Server ist mit dem Tag „"+MaintenanceTag+"“ im Wartungsmodus.")
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), "Wartungsmodus: kein automatischer Neustart.")
 		return
 	}
-	if !ap.s.online(srv) || !serviceStopped(srv, sig.Service) {
-		return // the service recovered on its own, or the server is gone
+	if !ap.s.online(srv) {
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), "")
+		return
+	}
+	if !serviceStopped(srv, sig.Service) {
+		return // recovered on its own; the incident closes via the running signal
 	}
 	if ap.recentlyStoppedByPerson(srv.ID, sig.Service) {
 		ap.note(srv.ID, store.SevInfo, "Autopilot: "+sig.Service+" bewusst gestoppt – kein Neustart", "Der Dienst wurde in der letzten Stunde von einer Person über ServerBrain gestoppt.")
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), "Der Dienst wurde bewusst von einer Person gestoppt.")
 		return
 	}
 	key := srv.ID + "|" + strings.ToLower(sig.Service)
@@ -180,7 +163,7 @@ func (ap *Autopilot) restartService(sig knowledge.Signal) {
 	if exhausted {
 		ap.note(srv.ID, store.SevCrit, "Autopilot gibt auf: "+sig.Service+" fällt wiederholt aus",
 			fmt.Sprintf("%d Startversuche in %s. Weitere automatische Neustarts würden das Problem nur verdecken – Eskalation.", len(recent), ap.cfg.Window))
-		ap.s.autoAnalyze(srv.ID, fmt.Sprintf("Der Autostart-Dienst %s auf %s fällt wiederholt aus; der Autopilot hat ihn bereits %d-mal gestartet.", sig.Service, srv.Hostname, len(recent)))
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), fmt.Sprintf("Der Autopilot hat den Dienst bereits %d-mal gestartet; er fällt wiederholt aus.", len(recent)))
 		return
 	}
 	reason := fmt.Sprintf("Autopilot: Autostart-Dienst %s ist seit über %s gestoppt (Versuch %d von %d)", sig.Service, ap.cfg.Grace.Round(time.Second), len(recent), ap.cfg.MaxAttempts)
@@ -188,17 +171,19 @@ func (ap *Autopilot) restartService(sig knowledge.Signal) {
 	switch {
 	case status == http.StatusForbidden:
 		ap.note(srv.ID, store.SevWarn, "Autopilot darf "+sig.Service+" nicht starten", "Die Policy blockiert service.start für den Autopilot (Regel "+dec.Rule+").")
-		ap.s.autoAnalyze(srv.ID, sig.Title+"\n"+sig.Detail)
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), "Die Policy erlaubt dem Autopilot keinen Neustart.")
 		return
 	case err != nil:
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), "")
 		return // e.g. no service.start capability on this agent
 	case cmd.Status == store.StatusPendingApproval:
 		ap.note(srv.ID, store.SevInfo, "Autopilot schlägt Neustart von "+sig.Service+" vor", "Die Policy verlangt eine Freigabe (Regel "+dec.Rule+"). Der Vorschlag wartet unter „Freigaben“.")
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), "")
 		return
 	}
 	done, err := ap.s.waitCommand(ap.ctx, cmd.ID, actionWaitLimit)
 	if err != nil || done.Status != store.StatusSucceeded {
-		ap.s.autoAnalyze(srv.ID, fmt.Sprintf("%s\n%s\nDer Autopilot konnte den Dienst nicht starten.", sig.Title, sig.Detail))
+		ap.s.escalateIncident(srv.ID, svcKey(sig.Service), "Der Autopilot konnte den Dienst nicht starten.")
 	}
 }
 
@@ -231,29 +216,7 @@ func (ap *Autopilot) inspectDisk(sig knowledge.Signal) {
 	if err == nil && cmd.Status != store.StatusPendingApproval {
 		_, _ = ap.s.waitCommand(ap.ctx, cmd.ID, 10*time.Minute) // the result is journaled
 	}
-	ap.s.autoAnalyze(srv.ID, sig.Title+"\n"+sig.Detail+"\nDie größten Dateien wurden bereits ermittelt (siehe Servertagebuch).")
+	ap.s.escalateIncident(srv.ID, "disk:"+sig.Disk, "Die größten Dateien wurden bereits vom Autopilot ermittelt (siehe Servertagebuch).")
 }
 
-// autoAnalyze starts a rate-limited, read-only AI analysis of an incident.
-func (s *Server) autoAnalyze(serverID, incident string) {
-	if s.ai == nil || !s.cfg.AutoAnalysis {
-		return
-	}
-	interval := s.cfg.AutoAnalysisInterval
-	if interval == 0 {
-		interval = 30 * time.Minute
-	}
-	s.assistant.mu.Lock()
-	if last, ok := s.assistant.lastAuto[serverID]; ok && time.Since(last) < interval {
-		s.assistant.mu.Unlock()
-		return
-	}
-	s.assistant.lastAuto[serverID] = time.Now()
-	s.assistant.mu.Unlock()
-	srv, err := s.store.GetServer(context.Background(), serverID)
-	if err != nil {
-		return
-	}
-	q := "Automatische Analyse: " + incident + "\n\nUntersuche die Ursache mit den Tools und empfiehl eine Lösung. Du arbeitest unbeaufsichtigt und darfst nur read-only Diagnose-Aktionen ausführen; Änderungen empfiehlst du nur."
-	s.startRun("ServerBrain", "auto", autoActor, srv, q)
-}
+func svcKey(service string) string { return "svc:" + strings.ToLower(service) }

@@ -159,6 +159,11 @@ async function refreshApprovalCount() {
     const b = document.getElementById("approval-count");
     b.textContent = n;
     b.hidden = n === 0;
+    const open = await api("GET", "/api/incidents?open=1");
+    const waiting = open.filter((i) => ["proposed", "failed", "manual", "new"].includes(i.status)).length;
+    const ib = document.getElementById("incident-count");
+    ib.textContent = waiting;
+    ib.hidden = waiting === 0;
   } catch (_) { /* ignore */ }
 }
 setInterval(refreshApprovalCount, 15000);
@@ -173,7 +178,7 @@ function route() {
   const name = parts[0] || "overview";
   for (const a of document.querySelectorAll("nav a")) a.classList.toggle("active", a.dataset.route === (name === "servers" ? "overview" : name));
   clearInterval(state.timer);
-  const views = { overview: viewOverview, servers: () => viewServer(parts[1]), approvals: viewApprovals, journal: viewJournal, assistant: () => viewAssistant(parts[1]), commands: viewCommands, events: viewEvents, audit: viewAudit, settings: viewSettings };
+  const views = { overview: viewOverview, servers: () => viewServer(parts[1]), approvals: viewApprovals, incidents: () => viewIncidents(parts[1]), journal: viewJournal, assistant: () => viewAssistant(parts[1]), commands: viewCommands, events: viewEvents, audit: viewAudit, settings: viewSettings };
   (views[name] || viewOverview)();
 }
 window.addEventListener("hashchange", route);
@@ -182,13 +187,16 @@ window.addEventListener("hashchange", route);
 
 async function viewOverview() {
   const alertsPanel = h("div", { class: "panel" }, h("h2", {}, "Alerts"), h("div", { class: "empty" }, "Lade…"));
+  const incidentsPanel = h("div");
   const grid = h("div", { class: "grid" });
   const summary = h("p", { class: "muted" });
-  setView(h("h1", {}, "Übersicht"), summary, alertsPanel, h("h2", {}, "Server"), grid);
+  setView(h("h1", {}, "Übersicht"), summary, incidentsPanel, alertsPanel, h("h2", {}, "Server"), grid);
 
   async function load() {
     try {
-      const [servers, alerts] = await Promise.all([api("GET", "/api/servers"), api("GET", "/api/alerts")]);
+      const [servers, alerts, incidents] = await Promise.all([api("GET", "/api/servers"), api("GET", "/api/alerts"), api("GET", "/api/incidents?open=1")]);
+      incidentsPanel.replaceChildren(...(incidents.length ? [h("div", { class: "panel incidents-panel" },
+        h("h2", {}, "Offene Vorfälle"), incidents.map(incidentRow))] : []));
       const online = servers.filter((s) => s.online).length;
       summary.textContent = `${servers.length} Server · ${online} online · ${alerts.filter((a) => a.severity === "critical").length} kritische Alerts`;
       alertsPanel.replaceChildren(h("h2", {}, "Alerts"),
@@ -614,6 +622,114 @@ function commandsTable(cmds, withHost) {
       h("td", { class: "small" }, c.requested_by + (c.actor_type === "ai" ? " (KI)" : ""))))));
 }
 
+// ---------- incidents ----------
+
+const incStatus = {
+  new: ["neu", "queued"], autopilot: ["Autopilot arbeitet", "dispatched"], analyzing: ["wird analysiert…", "dispatched"],
+  proposed: ["Lösung bereit", "pending_approval"], manual: ["manuell lösen", "warning"], executing: ["wird umgesetzt…", "dispatched"],
+  failed: ["nicht behoben", "failed"], resolved: ["behoben", "succeeded"], dismissed: ["verworfen", "cancelled"],
+};
+const stepStatus = { pending: "offen", running: "läuft…", waiting_approval: "wartet auf Freigabe", succeeded: "erfolgreich", failed: "fehlgeschlagen",
+  blocked: "gesperrt", skipped: "übersprungen", timeout: "Zeitüberschreitung", rejected: "abgelehnt", expired: "abgelaufen", cancelled: "abgebrochen" };
+const effectText = { allow: "läuft sofort", approve: "braucht Freigabe", block: "für dich gesperrt" };
+
+function incStatusBadge(st) {
+  const [label, cls] = incStatus[st] || [st, "queued"];
+  return sev(label, cls);
+}
+
+function incidentRow(inc) {
+  return h("a", { class: "incident-row", href: "#/incidents/" + inc.id },
+    incStatusBadge(inc.status),
+    h("strong", {}, inc.hostname),
+    h("span", { class: "msg" }, inc.title + (inc.occurrences > 1 ? ` (${inc.occurrences}×)` : "")),
+    inc.status === "proposed" ? h("span", { class: "tag" }, inc.plan.length + " Schritt(e) zur Bestätigung") : null,
+    h("span", { class: "muted small" }, ago(inc.updated_at)));
+}
+
+async function viewIncidents(id) {
+  if (id) return viewIncident(id);
+  const filter = h("select", {}, h("option", { value: "1" }, "offene Vorfälle"), h("option", { value: "" }, "alle Vorfälle"));
+  const box = h("div", { class: "panel" });
+  setView(h("h1", {}, "Vorfälle"),
+    h("p", { class: "muted" }, "Erkannte Fehler werden automatisch analysiert, und eine Lösung wird vorbereitet. Nichts Veränderndes passiert ohne deine Bestätigung – außer dem, was der Autopilot laut Policy selbst darf. Nach der Umsetzung prüft ServerBrain, ob das Problem wirklich behoben ist."),
+    h("div", { class: "row" }, filter), box);
+  const load = async () => {
+    try {
+      const list = await api("GET", "/api/incidents?open=" + filter.value);
+      box.replaceChildren(...(list.length ? list.map(incidentRow) : [h("div", { class: "empty" }, "Keine Vorfälle.")]));
+    } catch (e) { box.replaceChildren(errorBox(e)); }
+  };
+  filter.addEventListener("change", load);
+  await load();
+  every(10000, load);
+}
+
+async function viewIncident(id) {
+  const box = h("div");
+  setView(h("div", { class: "row" }, h("a", { href: "#/incidents" }, "← Vorfälle")), box);
+  const selected = new Map();
+  let last = "";
+  const load = async () => {
+    let inc;
+    try { inc = await api("GET", "/api/incidents/" + id); } catch (e) { box.replaceChildren(errorBox(e)); return; }
+    const sig = JSON.stringify(inc);
+    if (sig === last) return;
+    last = sig;
+    inc.plan.forEach((_, i) => { if (!selected.has(i)) selected.set(i, true); });
+    const canRun = canOperate() && state.me.kind !== "ai" && (inc.status === "proposed" || inc.status === "failed") && inc.plan.length > 0;
+    const steps = inc.plan.map((st, i) => {
+      const cb = h("input", { type: "checkbox", checked: selected.get(i), disabled: !canRun, "aria-label": "Schritt " + (i + 1) + " ausführen" });
+      cb.addEventListener("change", () => selected.set(i, cb.checked));
+      return h("div", { class: "plan-step" },
+        h("div", { class: "plan-head" }, cb, h("strong", {}, (i + 1) + ". " + st.action),
+          h("span", { class: "muted small" }, Object.entries(st.params || {}).map(([k, v]) => k + "=" + v).join(" ")),
+          sev(st.risk, st.risk === "critical" ? "critical-risk" : st.risk), st.read_only ? h("span", { class: "tag" }, "read-only") : null,
+          h("span", { class: "spacer" }),
+          st.status && st.status !== "pending" ? sev(stepStatus[st.status] || st.status, st.status === "succeeded" ? "succeeded" : ["running", "waiting_approval"].includes(st.status) ? "dispatched" : st.status === "skipped" ? "cancelled" : "failed")
+            : h("span", { class: "muted small" }, effectText[inc.effects[i]] || "")),
+        h("div", { class: "small" }, st.reason),
+        h("details", {}, h("summary", { class: "small" }, "Befehle anzeigen"), h("pre", {}, st.preview)),
+        st.output ? h("pre", { class: "step-output" }, st.output) : null);
+    });
+    const execute = async () => {
+      const chosen = [...selected.entries()].filter(([, v]) => v).map(([k]) => k);
+      if (!chosen.length) return alert("Bitte mindestens einen Schritt auswählen.");
+      const list = chosen.map((i) => `${i + 1}. ${inc.plan[i].action} ${Object.entries(inc.plan[i].params || {}).map(([k, v]) => k + "=" + v).join(" ")}`).join("\n");
+      if (!confirm(`Diese Schritte auf ${inc.hostname} ausführen?\n\n${list}\n\nDie Ausführung läuft über die Policy und wird in deinem Namen protokolliert.`)) return;
+      try { await api("POST", `/api/incidents/${id}/execute`, { steps: chosen }); load(); refreshApprovalCount(); } catch (e) { alert(e.message); }
+    };
+    const analyze = async () => { try { await api("POST", `/api/incidents/${id}/analyze`); load(); } catch (e) { alert(e.message); } };
+    const close = async (resolved) => {
+      const note = prompt(resolved ? "Was wurde gemacht? (für das Tagebuch)" : "Warum wird der Vorfall verworfen?");
+      if (note === null) return;
+      try { await api("POST", `/api/incidents/${id}/close`, { resolved, note }); load(); refreshApprovalCount(); } catch (e) { alert(e.message); }
+    };
+    const open = !["resolved", "dismissed"].includes(inc.status);
+    box.replaceChildren(...[
+      h("h1", { class: "row" }, incStatusBadge(inc.status), inc.title),
+      h("p", { class: "muted" }, h("a", { href: "#/servers/" + inc.server_id }, inc.hostname), ` · erkannt ${fmtTime(inc.created_at)}`,
+        inc.occurrences > 1 ? ` · ${inc.occurrences}× aufgetreten` : "", inc.analysis_by ? ` · Analyse: ${inc.analysis_by}` : "",
+        inc.decided_by ? ` · bestätigt von ${inc.decided_by}` : ""),
+      inc.resolution ? h("div", { class: inc.status === "resolved" ? "notice ok" : "notice bad" }, inc.resolution) : null,
+      h("div", { class: "panel" }, h("h2", {}, "Auslöser"), h("pre", { class: "notes" }, inc.trigger || "–")),
+      h("div", { class: "panel" }, h("h2", {}, "Diagnose"),
+        inc.status === "analyzing" ? h("p", { class: "muted" }, "Die KI analysiert den Vorfall …", inc.run_id ? [" ", h("a", { href: "#/assistant/" + inc.run_id }, "Analyse live ansehen")] : null)
+          : inc.status === "autopilot" ? h("p", { class: "muted" }, "Der Autopilot versucht zuerst die Standardlösung. Gelingt sie nicht, wird der Vorfall analysiert.")
+          : inc.diagnosis ? md(inc.diagnosis) : h("p", { class: "muted" }, "Noch keine Analyse."),
+        inc.run_id && inc.status !== "analyzing" ? h("p", { class: "small" }, h("a", { href: "#/assistant/" + inc.run_id }, "Analyse-Schritte der KI ansehen")) : null),
+      inc.plan.length ? h("div", { class: "panel" }, h("h2", {}, "Vorbereitete Lösung"), steps,
+        canRun ? h("div", { class: "row decision" }, h("button", { class: "primary", onclick: execute }, inc.status === "failed" ? "Erneut umsetzen" : "Lösung umsetzen"),
+          h("span", { class: "muted small" }, "Ausführung in deinem Namen über die Policy; danach automatische Erfolgsprüfung.")) : null) : null,
+      open && canOperate() ? h("div", { class: "row decision" },
+        state.ai && state.ai.enabled && !["analyzing", "executing"].includes(inc.status) ? h("button", { class: "ai", onclick: analyze }, inc.diagnosis ? "✨ Neu analysieren" : "✨ Mit KI analysieren") : null,
+        inc.status !== "executing" ? h("button", { onclick: () => close(true) }, "Als erledigt markieren") : null,
+        inc.status !== "executing" ? h("button", { class: "danger", onclick: () => close(false) }, "Verwerfen") : null) : null].filter(Boolean));
+  };
+  await load();
+  every(2500, load);
+}
+
 // ---------- AI assistant ----------
 
 // md renders the small Markdown subset the assistant uses into DOM nodes
@@ -724,7 +840,7 @@ async function viewAssistant(arg) {
     header.replaceChildren(
       h("h2", {}, run.title),
       h("span", { class: "spacer" }),
-      run.hostname ? h("a", { href: "#/servers/" + run.server_id }, run.hostname) : null,
+      run.hostname ? h("a", { href: "#/servers/" + run.server_id }, run.hostname) : "",
       sev(run.status === "running" ? "analysiert…" : run.status === "error" ? "Fehler" : "fertig", run.status === "running" ? "dispatched" : run.status === "error" ? "failed" : "succeeded"));
     const canAsk = run.status !== "running" && owner === state.me.name;
     footer.hidden = owner !== state.me.name;

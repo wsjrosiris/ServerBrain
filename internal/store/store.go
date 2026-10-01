@@ -112,7 +112,7 @@ func Open(path string) (*Store, error) {
 	}
 	// SQLite allows one writer; serializing keeps things simple and safe.
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema + schemaKnowledge); err != nil {
+	if _, err := db.Exec(schema + schemaKnowledge + schemaIncidents); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}

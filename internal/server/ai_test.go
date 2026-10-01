@@ -196,16 +196,25 @@ type aiEnv struct {
 }
 
 func newAIEnv(t *testing.T, ctx context.Context, cfg server.Config, autopilot bool) *aiEnv {
+	return newAIEnvOpt(t, ctx, cfg, autopilot, true)
+}
+
+func newAIEnvOpt(t *testing.T, ctx context.Context, cfg server.Config, autopilot, withAI bool) *aiEnv {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	st, err := store.Open(filepath.Join(t.TempDir(), "sb.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	cfg.HeartbeatInterval, cfg.LongPollTimeout = 5*time.Second, time.Second
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = 5 * time.Second
+	}
+	cfg.LongPollTimeout = time.Second
 	srv := server.New(cfg, st, policy.Default(), log)
 	llm := &scriptLLM{}
-	srv.SetAI(llm)
+	if withAI {
+		srv.SetAI(llm)
+	}
 	if autopilot {
 		srv.EnableAutopilot(ctx, server.AutopilotConfig{Grace: time.Millisecond})
 	}
@@ -342,7 +351,7 @@ func TestAIOperatorDiagnosesThroughPolicy(t *testing.T) {
 func TestAutopilotRestartsServiceAndEscalates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	a := newAIEnv(t, ctx, server.Config{AutoAnalysis: true}, true)
+	a := newAIEnv(t, ctx, server.Config{AutoAnalysis: true, AutoAnalysisInterval: time.Nanosecond}, true)
 	a.llm.respond = func(turn int, q string, results []ai.ToolResult) *ai.Reply {
 		if turn == 0 {
 			if !strings.HasPrefix(q, "[Kontext") || !strings.Contains(q, "Automatische Analyse") {
@@ -365,6 +374,11 @@ func TestAutopilotRestartsServiceAndEscalates(t *testing.T) {
 	j := a.journalTitles()["Aktion ausgeführt: service.start (name=W3SVC)"]
 	if j["author"] != "Autopilot" || !strings.Contains(j["detail"].(string), "Autopilot: Autostart-Dienst W3SVC") {
 		t.Errorf("autopilot entry: %v", j)
+	}
+	a.agent.beat() // the service runs again → the incident closes itself
+	waitFor(t, func() bool { _, ok := a.journalTitles()["Vorfall behoben: Dienst gestoppt: W3SVC"]; return ok }, a.journalTitles)
+	if inc := a.list(a.admin, "/api/incidents"); len(inc) != 1 || inc[0]["status"] != "resolved" || !strings.Contains(inc[0]["resolution"].(string), "Vom Autopilot behoben") {
+		t.Errorf("incident after autopilot: %v", inc)
 	}
 
 	// 2. Maintenance mode: the autopilot leaves the server alone.
@@ -396,25 +410,19 @@ func TestAutopilotRestartsServiceAndEscalates(t *testing.T) {
 			}
 		}
 	}()
-	waitFor(t, func() bool {
-		for title := range a.journalTitles() {
-			if strings.HasPrefix(title, "Automatische KI-Analyse:") {
-				return true
-			}
-		}
-		return false
-	}, a.journalTitles)
+	const done = "Analyse abgeschlossen – manuelle Lösung nötig: Dienst gestoppt: W3SVC"
+	waitFor(t, func() bool { _, ok := a.journalTitles()[done]; return ok }, a.journalTitles)
 	titles := a.journalTitles()
 	if _, ok := titles["Aktion fehlgeschlagen: service.start (name=W3SVC)"]; !ok {
 		t.Errorf("failed start not journaled: %v", titles)
 	}
-	for title, e := range titles {
-		if strings.HasPrefix(title, "Automatische KI-Analyse:") {
-			// The automatic analysis acts read-only: its service.start was blocked.
-			if !strings.Contains(e["detail"].(string), "gesperrt") || e["author"] != "KI (automatisch)" {
-				t.Errorf("auto analysis: %v", e)
-			}
-		}
+	// The automatic analysis acts read-only: its own service.start was blocked.
+	if e := titles[done]; !strings.Contains(e["detail"].(string), "gesperrt") || e["author"] != "KI (automatisch)" {
+		t.Errorf("auto analysis: %v", e)
+	}
+	open := a.list(a.admin, "/api/incidents?open=1")
+	if len(open) != 1 || open[0]["status"] != "manual" || !strings.Contains(open[0]["trigger"].(string), "konnte den Dienst nicht starten") {
+		t.Errorf("escalated incident: %v", open)
 	}
 	runs := a.list(a.admin, "/api/assistant")
 	if len(runs) == 0 || runs[0]["origin"] != "auto" {

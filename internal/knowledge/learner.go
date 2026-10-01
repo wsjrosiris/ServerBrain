@@ -35,6 +35,10 @@ const (
 	SignalDiskCritical   = "disk_critical"   // a disk crossed the critical threshold
 	SignalCriticalEvent  = "critical_event"  // a Critical event log entry
 	SignalOffline        = "offline"         // agent stopped reporting
+	SignalNewError       = "new_error"       // first occurrence of an error pattern
+	SignalServiceRunning = "service_running" // a stopped service runs again
+	SignalDiskRecovered  = "disk_recovered"  // a disk is below the threshold again
+	SignalOnline         = "online"          // agent reports again
 )
 
 // Signal is a structured observation about a server.
@@ -43,7 +47,9 @@ type Signal struct {
 	ServerID string
 	Hostname string
 	Service  string // service_stopped
-	Disk     string // disk_critical
+	Disk     string // disk_critical, disk_recovered
+	Source   string // new_error, critical_event: event source
+	EventID  int
 	Title    string // human readable summary (as in the diary)
 	Detail   string
 }
@@ -107,6 +113,7 @@ func (l *Learner) Observe(ctx context.Context, prev *store.Server, hb *protocol.
 			}
 		}
 		l.add(ctx, id, store.CatAvailability, store.SevOK, "Wieder erreichbar", detail)
+		l.signal(Signal{Kind: SignalOnline, ServerID: id, Hostname: hb.System.Hostname})
 	}
 	_, _ = l.st.SetFact(ctx, id, "status", "online")
 
@@ -213,6 +220,7 @@ func (l *Learner) compareServices(ctx context.Context, id, host string, old, hb 
 			l.signal(Signal{Kind: SignalServiceStopped, ServerID: id, Hostname: host, Service: s.Name, Title: title, Detail: detail})
 		case p.Status == "Stopped" && s.Status == "Running" && relevant:
 			l.add(ctx, id, store.CatService, store.SevOK, "Dienst läuft wieder: "+s.Name, label(s))
+			l.signal(Signal{Kind: SignalServiceRunning, ServerID: id, Hostname: host, Service: s.Name})
 		}
 		if p.StartType != "" && s.StartType != "" && !strings.EqualFold(p.StartType, s.StartType) {
 			l.add(ctx, id, store.CatService, store.SevInfo, "Starttyp geändert: "+s.Name, p.StartType+" → "+s.StartType)
@@ -308,6 +316,7 @@ func (l *Learner) learnDisks(ctx context.Context, id, host string, hb *protocol.
 		case level == prevLevel:
 		case level == "ok":
 			l.add(ctx, id, store.CatResource, store.SevOK, "Datenträger "+d.Name+" wieder unter 90 %", desc)
+			defer l.signal(Signal{Kind: SignalDiskRecovered, ServerID: id, Hostname: host, Disk: d.Name})
 		case level == "crit" || prevLevel == "ok":
 			l.add(ctx, id, store.CatResource, sevFor(level), "Datenträger "+d.Name+" fast voll", desc)
 		}
@@ -347,7 +356,7 @@ func (l *Learner) learnEvents(ctx context.Context, id, host string, events []pro
 			critical++
 			title := fmt.Sprintf("Kritisches Ereignis: %s (ID %d)", e.Source, e.EventID)
 			l.add(ctx, id, store.CatEvent, store.SevCrit, title, firstLines(e.Message, 6))
-			l.signal(Signal{Kind: SignalCriticalEvent, ServerID: id, Hostname: host, Title: title, Detail: firstLines(e.Message, 6)})
+			l.signal(Signal{Kind: SignalCriticalEvent, ServerID: id, Hostname: host, Source: e.Source, EventID: e.EventID, Title: title, Detail: firstLines(e.Message, 6)})
 		}
 		k := fmt.Sprintf("errsig:%s|%d", e.Source, e.EventID)
 		if s, ok := sigs[k]; ok {
@@ -379,6 +388,9 @@ func (l *Learner) learnEvents(ctx context.Context, id, host string, events []pro
 			title += fmt.Sprintf(", %d×", s.count)
 		}
 		l.add(ctx, id, store.CatEvent, store.SevWarn, title, firstLines(s.msg, 6))
+		if s.level == "Error" {
+			l.signal(Signal{Kind: SignalNewError, ServerID: id, Hostname: host, Source: s.source, EventID: s.id, Title: title, Detail: firstLines(s.msg, 6)})
+		}
 	}
 	if skipped > 0 {
 		l.add(ctx, id, store.CatEvent, store.SevWarn, fmt.Sprintf("%d weitere neue Fehlerbilder", skipped), "Details in der Ereignisansicht von ServerBrain.")

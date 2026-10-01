@@ -188,3 +188,16 @@ details.step summary { cursor: pointer; }
 details.step.bad summary { color: var(--warn); }
 details.step pre { max-height: 260px; }
 .examples { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+
+/* incidents */
+.incident-row { display: flex; gap: 10px; align-items: center; padding: 9px 4px; border-bottom: 1px solid var(--border); color: var(--text); flex-wrap: wrap; }
+.incident-row:last-child { border-bottom: none; }
+.incident-row:hover { text-decoration: none; background: var(--bg); }
+.incident-row .msg { flex: 1; min-width: 200px; }
+.incidents-panel { border-color: var(--warn); }
+.plan-step { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
+.plan-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.plan-head input[type=checkbox] { width: auto; }
+.step-output { max-height: 200px; }
+.notice.ok { border-color: var(--ok); background: rgba(31,157,85,.1); }
+.notice.bad { border-color: var(--crit); background: rgba(214,69,69,.1); }

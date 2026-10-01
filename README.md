@@ -82,6 +82,7 @@ Für die Entwicklung läuft der Agent auch unter Linux und meldet dann Metriken 
 | Dienste | Komplette Dienstliste mit Status und Starttyp, Start/Stopp/Neustart per Klick |
 | Event Logs | System/Application, Warnung und höher, inkrementell übertragen, 30 Tage Aufbewahrung |
 | Alerts | Server offline, Disk ≥ 90/95 %, RAM/CPU ≥ 95 %, gestoppte Autostart-Dienste, Fehlerhäufung, jeweils mit **vorgeschlagener Aktion** |
+| Vorfälle | Automatische Analyse erkannter Fehler, vorbereitete Lösung, Umsetzung per Bestätigung, Erfolgsprüfung (siehe unten) |
 | KI-Operator & Autopilot | Assistent mit Tool Use, Explain & Fix, automatische Incident-Analyse, Self-Healing-Playbooks (siehe unten) |
 | Second Brain | Automatisches Lernen von Rollen, Abhängigkeiten, Baselines und Fehlerbildern, **Servertagebuch**, **Obsidian-Vault** (siehe unten) |
 | Remote PowerShell | Interaktive, dauerhafte PowerShell-Sitzung auf dem Server, **immer über den Agenten** (siehe unten). Lokal opt-in, standardmäßig nur für Admins, jede Eingabe auditiert |
@@ -130,6 +131,33 @@ Browser ──HTTPS──▶ Zentrale ──(Policy, Audit)──▶ Warteschlan
 - **Hinweis:** Befehle, die selbst von der Standardeingabe lesen (z. B. eine verschachtelte interaktive `cmd.exe`), sind nicht unterstützt. Interaktive Abfragen wie `Read-Host` schlagen im nicht-interaktiven Modus sofort fehl, statt zu hängen.
 
 Für einzelne, freigabepflichtige Skripte (z. B. von der KI vorgeschlagen) gibt es weiterhin die Aktion `shell.run`.
+
+## Vorfälle: erkennen → analysieren → Lösung vorbereiten → bestätigen → prüfen
+
+Fehler, die ServerBrain auf einem System erkennt, werden automatisch zu **Vorfällen**. Für jeden Vorfall wird eine Lösung vorbereitet, die du mit einem Klick umsetzen lässt.
+
+```text
+Fehler erkannt ──▶ Vorfall ──▶ (Autopilot, falls sicher) ──▶ Analyse (KI read-only oder Regel)
+   ──▶ vorbereitete Lösung: geprüfte Katalog-Aktionen + Befehlsvorschau
+   ──▶ du bestätigst (Schritte abwählbar) ──▶ Ausführung über die Policy in deinem Namen
+   ──▶ Erfolgsprüfung mit frischen Agent-Daten ──▶ behoben / nicht behoben
+```
+
+| Erkannt wird | Vorbereitete Lösung (Beispiele) | Erfolgsprüfung |
+|---|---|---|
+| Autostart-/rollenkritischer Dienst gestoppt | KI: Ursache beheben (z. B. Logs archivieren) und Dienst starten. Regel: Dienst starten | Dienst läuft wieder |
+| Datenträger kritisch (≥ 95 %) | KI: gezielt archivieren/bereinigen. Regel: große Dateien ermitteln, Temp bereinigen | Belegung < 95 % |
+| Neues Fehlerbild, kritisches Ereignis | KI-Diagnose mit passenden Aktionen oder einer manuellen Anleitung | – (manuell schließen) |
+| Server nicht erreichbar | Diagnose mit Ursachen; schließt sich, sobald der Agent sich wieder meldet | Agent meldet sich |
+
+- **Nichts Veränderndes ohne Bestätigung.** Die automatische Analyse darf nur lesen. Die vorbereiteten Schritte werden validiert (Katalog, Capabilities des Servers, Parameter) und sind nie freie Skripte. Die Ausführung läuft als die bestätigende Person durch die Policy. Braucht ein Schritt eine Freigabe, zählt die Bestätigung eines Admins als Freigabe, außer das Vier-Augen-Prinzip ist aktiv (`allow_self_approval: false`).
+- **Prüfung statt Hoffnung.** Nach der Umsetzung wartet ServerBrain auf neue Daten des Agenten und prüft das ursprüngliche Symptom. Besteht es weiter, steht der Vorfall auf *nicht behoben* und kann erneut analysiert oder umgesetzt werden.
+- **Keine Vorfall-Flut.** Wiederholungen zählen hoch, statt neue Vorfälle zu erzeugen. Fehlerereignisse, die innerhalb von 10 Minuten nach einem anderen Problem auf demselben Server auftreten, werden als **begleitende Symptome** an diesen Vorfall gehängt.
+- **Selbstheilung zählt mit.** Behebt der Autopilot das Problem oder verschwindet es von selbst, schließt sich der Vorfall automatisch.
+- **Alles im Tagebuch und in Obsidian:** Vorfall erkannt, Lösung vorbereitet, Lösung bestätigt (von wem), jede Aktion mit Ausgabe, Vorfall behoben oder nicht behoben.
+- Ohne KI gibt es regelbasierte Standardlösungen. Mit KI lassen sich Analysen pro Vorfall auch manuell neu starten.
+
+Konsole: **Vorfälle** (Badge = Vorfälle, die auf dich warten) und ein Panel „Offene Vorfälle“ auf der Übersicht.
 
 ## KI-Operator
 
@@ -280,6 +308,9 @@ Alle Operator-Endpunkte erwarten `Authorization: Bearer <token>`.
 | `GET /api/servers/{id}/knowledge` | viewer | Gelerntes Wissen und Obsidian-Notizen |
 | `GET /api/dependencies` | viewer | Gelernter Abhängigkeitsgraph |
 | `GET /api/knowledge/context?server=` | viewer | Markdown-Briefing für die KI |
+| `GET /api/incidents?open=1` · `GET /api/incidents/{id}` | viewer | Vorfälle mit Diagnose, vorbereiteter Lösung und Policy-Effekt je Schritt |
+| `POST /api/incidents/{id}/execute {steps}` | operator | Lösung bestätigen und umsetzen (optional nur ausgewählte Schritte) |
+| `POST /api/incidents/{id}/analyze` · `/close {resolved, note}` | operator | Neu analysieren / manuell erledigen oder verwerfen |
 | `GET /api/assistant/status` | viewer | Ist die KI aktiv, welches Modell |
 | `POST /api/assistant` · `POST /api/assistant/{id}/ask` | viewer* | Frage stellen `{question, server_id}` / Folgefrage (*KI handelt mit der Rolle des Fragenden) |
 | `GET /api/assistant` · `GET /api/assistant/{id}/steps?after=N` | viewer | Eigene Analysen (Admins: alle) / Long-Poll auf Schritte |

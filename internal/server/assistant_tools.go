@@ -41,8 +41,8 @@ func num(in map[string]any, k string, def, lo, hi int) int {
 
 var serverProp = map[string]any{"type": "string", "description": "Hostname (z. B. WEB-03) oder server_id"}
 
-func (s *Server) aiTools() []ai.Tool {
-	tools := s.toolset()
+func (s *Server) aiTools(run *Run) []ai.Tool {
+	tools := s.toolset(run)
 	out := make([]ai.Tool, len(tools))
 	for i, t := range tools {
 		out[i] = t.def
@@ -50,8 +50,8 @@ func (s *Server) aiTools() []ai.Tool {
 	return out
 }
 
-func (s *Server) toolByName(name string) (assistantTool, bool) {
-	for _, t := range s.toolset() {
+func (s *Server) toolByName(run *Run, name string) (assistantTool, bool) {
+	for _, t := range s.toolset(run) {
 		if t.def.Name == name {
 			return t, true
 		}
@@ -81,7 +81,37 @@ func (s *Server) resolveServer(ctx context.Context, ref string) (*store.Server, 
 	return nil, fmt.Errorf("server %q nicht gefunden; bekannte Server: %s", ref, strings.Join(names, ", "))
 }
 
-func (s *Server) toolset() []assistantTool {
+func (s *Server) toolset(run *Run) []assistantTool {
+	tools := s.baseTools()
+	if run != nil && run.incidentID != "" {
+		tools = append(tools, assistantTool{
+			def: ai.Tool{Name: "propose_solution", Description: "Speichert Diagnose und vorbereitete Lösung für den analysierten Vorfall. Die Schritte werden NICHT ausgeführt, sondern einem Administrator zur Bestätigung vorgelegt. Nur Aktionen aus list_actions; freie Skripte sind nicht erlaubt. Leere steps, wenn das Problem manuell gelöst werden muss.",
+				Properties: map[string]any{
+					"diagnosis": map[string]any{"type": "string", "description": "Markdown: Ursachenkette, Belege, ggf. manuelle Schritte"},
+					"steps": map[string]any{"type": "array", "description": "Aktionen in Ausführungsreihenfolge (max. 8)", "items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"action": map[string]any{"type": "string"},
+							"params": map[string]any{"type": "object"},
+							"reason": map[string]any{"type": "string", "description": "Warum dieser Schritt nötig ist"},
+						},
+						"required": []string{"action", "reason"},
+					}},
+				}, Required: []string{"diagnosis", "steps"}},
+			label: func(in map[string]any) string {
+				n := 0
+				if st, ok := in["steps"].([]any); ok {
+					n = len(st)
+				}
+				return fmt.Sprintf("Bereitet eine Lösung mit %d Schritt(en) vor", n)
+			},
+			run: s.toolProposeSolution,
+		})
+	}
+	return tools
+}
+
+func (s *Server) baseTools() []assistantTool {
 	return []assistantTool{
 		{
 			def: ai.Tool{Name: "list_servers", Description: "Listet alle verwalteten Server mit Status, Betriebssystem, Rollen, Auslastung, vollstem Datenträger und Tags. Nutze das für Flottenfragen und um Server-Namen zu finden.",

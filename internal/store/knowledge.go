@@ -57,6 +57,8 @@ const (
 	CatAction       = "aktion"
 	CatConsole      = "konsole"
 	CatNote         = "notiz"
+	CatAI           = "ki"
+	CatAutopilot    = "autopilot"
 )
 
 // Journal severities.

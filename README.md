@@ -73,7 +73,7 @@ Die Konfiguration liegt in `C:\ProgramData\ServerBrain\agent.json`. Sie enthält
 
 Für die Entwicklung läuft der Agent auch unter Linux und meldet dann Metriken und Datenträger (`sb-agent run -config ./agent.json`, systemd-Unit unter `deploy/`).
 
-## Funktionen (Phase 1)
+## Funktionen
 
 | Bereich | Umfang |
 |---|---|
@@ -82,6 +82,7 @@ Für die Entwicklung läuft der Agent auch unter Linux und meldet dann Metriken 
 | Dienste | Komplette Dienstliste mit Status und Starttyp, Start/Stopp/Neustart per Klick |
 | Event Logs | System/Application, Warnung und höher, inkrementell übertragen, 30 Tage Aufbewahrung |
 | Alerts | Server offline, Disk ≥ 90/95 %, RAM/CPU ≥ 95 %, gestoppte Autostart-Dienste, Fehlerhäufung, jeweils mit **vorgeschlagener Aktion** |
+| KI-Operator & Autopilot | Assistent mit Tool Use, Explain & Fix, automatische Incident-Analyse, Self-Healing-Playbooks (siehe unten) |
 | Second Brain | Automatisches Lernen von Rollen, Abhängigkeiten, Baselines und Fehlerbildern, **Servertagebuch**, **Obsidian-Vault** (siehe unten) |
 | Remote PowerShell | Interaktive, dauerhafte PowerShell-Sitzung auf dem Server, **immer über den Agenten** (siehe unten). Lokal opt-in, standardmäßig nur für Admins, jede Eingabe auditiert |
 | Aktionen | siehe Katalog unten, mit Vorschau der Befehle und Policy-Entscheidung vor der Ausführung |
@@ -129,6 +130,48 @@ Browser ──HTTPS──▶ Zentrale ──(Policy, Audit)──▶ Warteschlan
 - **Hinweis:** Befehle, die selbst von der Standardeingabe lesen (z. B. eine verschachtelte interaktive `cmd.exe`), sind nicht unterstützt. Interaktive Abfragen wie `Read-Host` schlagen im nicht-interaktiven Modus sofort fehl, statt zu hängen.
 
 Für einzelne, freigabepflichtige Skripte (z. B. von der KI vorgeschlagen) gibt es weiterhin die Aktion `shell.run`.
+
+## KI-Operator
+
+Die KI arbeitet mit dem Wissen von ServerBrain. Sie bekommt keinen eigenen Zugang zu den Servern.
+
+```text
+Frage / Alert ──▶ Claude (Tool Use) ──▶ Tools: Wissen, Tagebuch, Ereignisse, Dienste, Alerts, Abhängigkeiten
+                                   └──▶ run_action ──▶ Policy (als Akteur „ai“) ──▶ sofort / Freigabe / gesperrt ──▶ Agent
+Antwort (Diagnose · Belege · Lösung) ──▶ Konsole + Servertagebuch + Obsidian
+```
+
+- **KI-Assistent** (Konsole → *✨ KI-Assistent*): Fragen wie „Warum ist WEB-03 down?“, „Welche Server haben < 10 GB frei?“ oder „Warum erreicht APP-03 den SQL-Server nicht?“. Jeder Schritt (welches Tool, welches Ergebnis) ist live sichtbar, Folgefragen sind möglich.
+- **Explain & Fix:** Der Button *✨ KI-Diagnose* an jedem Alert startet die Analyse mit vollem Kontext.
+- **Automatische Incident-Analyse:** Kritische Ereignisse und Eskalationen des Autopilots lösen eine **read-only** KI-Analyse aus, rate-limitiert auf eine pro Server und 30 Minuten. Das Ergebnis landet im Tagebuch und damit in Obsidian.
+- **Sicherheit:**
+  - Die KI handelt als Akteur `ai` mit **höchstens der Rolle des Fragenden** (Admins → operator, Viewer → nur read-only).
+  - Riskante Aktionen brauchen laut Policy eine Freigabe, `shell.run` ist für KI gesperrt.
+  - Die Begründung der KI wird Freigebenden angezeigt und auditiert.
+  - Tool-Ergebnisse gelten als Daten, nicht als Anweisungen.
+- **Modell:** Claude über das offizielle Go-SDK (`claude-opus-5-5`, adaptive Thinking, Effort `high`, serverseitiger Fallback bei Ablehnungen durch Sicherheitsfilter, Prompt-Caching für Systemprompt und Tools).
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+sb-server ... -ai auto -ai-model claude-opus-5-5 -ai-effort high -ai-auto-analysis=true
+```
+
+Ohne API-Key bleiben alle anderen Funktionen voll nutzbar (`-ai off` schaltet die KI explizit ab).
+
+## Autopilot (Self-Healing)
+
+Deterministische Playbooks ohne LLM, ausgelöst durch die Signale des Lerners. Jede Aktion läuft als Akteur **„Autopilot“** durch die Policy und landet im Tagebuch.
+
+| Auslöser | Playbook |
+|---|---|
+| Autostart-/rollenkritischer Dienst gestoppt | Karenzzeit (`-autopilot-grace`, Standard 2 min) abwarten. Läuft der Dienst dann noch nicht, `service.start` ausführen. Höchstens 3 Versuche in 24 h, danach **Eskalation** an die KI-Analyse statt endloser Neustarts. |
+| Datenträger kritisch (≥ 95 %) | `disk.large_files` (read-only), Ergebnis ins Tagebuch, danach KI-Analyse |
+| Kritisches Ereignis | KI-Analyse |
+
+- **Wartungsmodus:** Server mit dem Tag `wartung` lässt der Autopilot in Ruhe.
+- **Bewusst gestoppt:** Hat eine Person den Dienst in der letzten Stunde über ServerBrain gestoppt, wird er nicht neu gestartet.
+- **Policy:** Darf der Autopilot etwas nicht (`block`) oder nur mit Freigabe (`approve`), trägt er das ins Tagebuch ein bzw. legt den Vorschlag unter *Freigaben* ab.
+- `-autopilot=false` schaltet ihn ab.
 
 ## Second Brain: Wissen, Servertagebuch & Obsidian
 
@@ -237,6 +280,9 @@ Alle Operator-Endpunkte erwarten `Authorization: Bearer <token>`.
 | `GET /api/servers/{id}/knowledge` | viewer | Gelerntes Wissen und Obsidian-Notizen |
 | `GET /api/dependencies` | viewer | Gelernter Abhängigkeitsgraph |
 | `GET /api/knowledge/context?server=` | viewer | Markdown-Briefing für die KI |
+| `GET /api/assistant/status` | viewer | Ist die KI aktiv, welches Modell |
+| `POST /api/assistant` · `POST /api/assistant/{id}/ask` | viewer* | Frage stellen `{question, server_id}` / Folgefrage (*KI handelt mit der Rolle des Fragenden) |
+| `GET /api/assistant` · `GET /api/assistant/{id}/steps?after=N` | viewer | Eigene Analysen (Admins: alle) / Long-Poll auf Schritte |
 | `GET /api/audit` | admin | Audit Log |
 | `POST /api/enrollment-tokens`, `GET/POST /api/users` | admin | Verwaltung |
 
@@ -257,7 +303,8 @@ internal/actions      Aktionskatalog: Validierung, Vorschau, Skripte
 internal/policy       Policy Engine
 internal/store        SQLite-Persistenz
 internal/server       HTTP-API, Alerts, Sessions, eingebettete Web-Konsole (web/static)
-internal/knowledge    Second Brain: Rollen, Lerner (Tagebuch, Abhängigkeiten), Obsidian-Vault
+internal/knowledge    Second Brain: Rollen, Lerner (Tagebuch, Abhängigkeiten, Signale), Obsidian-Vault
+internal/ai           LLM-Anbindung (Claude über das Go-SDK) hinter einem schmalen Interface
 internal/agent        Collector (PowerShell/CIM unter Windows), Executor, native Aktionen
 internal/protocol     Wire-Typen Agent ↔ Zentrale
 deploy/               Beispiel-Policy, systemd-Units
@@ -265,8 +312,4 @@ deploy/               Beispiel-Policy, systemd-Units
 
 ## Roadmap
 
-**Phase 2: KI-Diagnose.** Diagnose-Assistent in der Konsole („Warum ist WEB-03 down?“) mit Tool Calling auf Basis von `/api/ai/tools`, „Explain & Fix“-Ansicht mit Diagnosepfad und empfohlenen Schritten, automatische Remediation über Policy-gesteuerte Autonomie, feinere RBAC (Server-Gruppen, Tag-Scopes), SSO/OIDC.
-
-**Phase 3: Infrastruktur-Kontext.** Serverübergreifende Root-Cause-Analyse auf Basis des gelernten Abhängigkeitsgraphen und des Tagebuchs, Flottenoperationen („auf allen Servern mit < 10 GB frei …“), Self-Healing-Playbooks, Compliance-Checks, Multi-Tenant, PostgreSQL als Backend.
-
-**Technische Härtung.** Agent-Selbstupdate mit signierten Binaries, signierte Commands (Ende-zu-Ende vom Freigebenden bis zum Agenten), Rotation der Agent-Secrets, Export des Audit Logs (Syslog/SIEM), WebSocket-Live-Updates in der UI.
+Siehe [docs/ENTWICKLUNGSPLAN.md](docs/ENTWICKLUNGSPLAN.md) mit Brainstorming, Priorisierung und Meilensteinen. Umgesetzt sind M1 (KI-Operator) und M2 (Autopilot). Als Nächstes folgen M3 (tiefere Daten: Healthchecks, Zertifikate, Update-Stand, Software-Inventar), M4 (Produktionsreife: MSI/GPO, SSO, Selbstupdate, signierte Commands) und M5 (lernende Automatisierung).

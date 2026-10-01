@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
@@ -28,15 +29,23 @@ type SuggestedAction struct {
 }
 
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
-	servers, err := s.store.ListServers(r.Context(), true)
+	alerts, err := s.computeAlerts(r.Context())
 	if err != nil {
 		s.internalErr(w, err)
 		return
 	}
-	errs, err := s.store.ErrorCounts(r.Context(), time.Now().Add(-time.Hour))
+	writeJSON(w, http.StatusOK, alerts)
+}
+
+// computeAlerts derives the currently active alerts from the latest state.
+func (s *Server) computeAlerts(ctx context.Context) ([]Alert, error) {
+	servers, err := s.store.ListServers(ctx, true)
 	if err != nil {
-		s.internalErr(w, err)
-		return
+		return nil, err
+	}
+	errs, err := s.store.ErrorCounts(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		return nil, err
 	}
 	alerts := []Alert{}
 	for _, srv := range servers {
@@ -93,7 +102,7 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		return alerts[i].Hostname < alerts[j].Hostname
 	})
-	writeJSON(w, http.StatusOK, alerts)
+	return alerts, nil
 }
 
 func humanBytes(n uint64) string {

@@ -176,8 +176,7 @@ type serverKnowledge struct {
 	NotePath      string                 `json:"note_path,omitempty"`
 }
 
-func (s *Server) knowledgeFor(r *http.Request, id string) (*serverKnowledge, error) {
-	ctx := r.Context()
+func (s *Server) knowledgeFor(ctx context.Context, id string) (*serverKnowledge, error) {
 	k := &serverKnowledge{VaultEnabled: s.vault != nil, Roles: []roleInfo{}}
 	facts, err := s.store.Facts(ctx, id, "role:")
 	if err != nil {
@@ -209,7 +208,7 @@ func (s *Server) handleServerKnowledge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "server not found")
 		return
 	}
-	k, err := s.knowledgeFor(r, id)
+	k, err := s.knowledgeFor(r.Context(), id)
 	if err != nil {
 		s.internalErr(w, err)
 		return
@@ -234,8 +233,7 @@ func (s *Server) handleDependencies(w http.ResponseWriter, r *http.Request) {
 // notes people wrote in Obsidian, and the recent server diary. This is the
 // "second brain" an AI assistant reads before it diagnoses anything.
 func (s *Server) handleKnowledgeContext(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("server")
-	srv, err := s.store.GetServer(r.Context(), id)
+	srv, err := s.store.GetServer(r.Context(), r.URL.Query().Get("server"))
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "server not found")
 		return
@@ -244,19 +242,28 @@ func (s *Server) handleKnowledgeContext(w http.ResponseWriter, r *http.Request) 
 		s.internalErr(w, err)
 		return
 	}
-	k, err := s.knowledgeFor(r, id)
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	doc, err := s.buildContext(r.Context(), srv, days)
 	if err != nil {
 		s.internalErr(w, err)
 		return
 	}
-	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Write([]byte(doc))
+}
+
+func (s *Server) buildContext(ctx context.Context, srv *store.Server, days int) (string, error) {
+	id := srv.ID
+	k, err := s.knowledgeFor(ctx, id)
+	if err != nil {
+		return "", err
+	}
 	if days <= 0 || days > 365 {
 		days = 14
 	}
-	diary, err := s.store.ListJournal(r.Context(), store.JournalFilter{ServerID: id, Since: time.Now().AddDate(0, 0, -days), Limit: 60})
+	diary, err := s.store.ListJournal(ctx, store.JournalFilter{ServerID: id, Since: time.Now().AddDate(0, 0, -days), Limit: 60})
 	if err != nil {
-		s.internalErr(w, err)
-		return
+		return "", err
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Server %s\n\n", srv.Hostname)
@@ -303,6 +310,5 @@ func (s *Server) handleKnowledgeContext(w http.ResponseWriter, r *http.Request) 
 			b.WriteString("\n")
 		}
 	}
-	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-	w.Write([]byte(b.String()))
+	return b.String(), nil
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 	_ "time/tzdata" // the diary time zone must work on hosts without tzdata
 
+	"github.com/wsjrosiris/serverbrain/internal/ai"
 	"github.com/wsjrosiris/serverbrain/internal/knowledge"
 	"github.com/wsjrosiris/serverbrain/internal/policy"
 	"github.com/wsjrosiris/serverbrain/internal/server"
@@ -37,6 +38,12 @@ func main() {
 		vaultDir   = flag.String("vault", "vault", "Obsidian vault directory for the knowledge base and server diary (empty disables it)")
 		vaultSub   = flag.String("vault-folder", "ServerBrain", "folder inside the vault that ServerBrain manages")
 		timezone   = flag.String("timezone", "Europe/Berlin", "time zone for the server diary")
+		aiMode     = flag.String("ai", "auto", "AI operator: auto (on when ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_PROFILE is set), on, off")
+		aiModel    = flag.String("ai-model", "claude-opus-5-5", "Claude model for the AI operator")
+		aiEffort   = flag.String("ai-effort", "high", "reasoning effort: low, medium, high, xhigh, max")
+		aiAuto     = flag.Bool("ai-auto-analysis", true, "let the AI analyse critical incidents automatically (read-only)")
+		autopilot  = flag.Bool("autopilot", true, "self-healing playbooks (restart stopped automatic services, inspect full disks)")
+		apGrace    = flag.Duration("autopilot-grace", 2*time.Minute, "how long a service may stay stopped before the autopilot acts")
 	)
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -55,7 +62,8 @@ func main() {
 		os.Exit(2)
 	}
 	vault := vaultOptions{dir: *vaultDir, folder: *vaultSub, loc: loc}
-	if err := run(log, *addr, *dbPath, *policyFile, *certFile, *keyFile, *clientCA, *interval, *trustProxy, vault); err != nil {
+	auto := automationOptions{aiMode: *aiMode, model: *aiModel, effort: *aiEffort, autoAnalysis: *aiAuto, autopilot: *autopilot, grace: *apGrace}
+	if err := run(log, *addr, *dbPath, *policyFile, *certFile, *keyFile, *clientCA, *interval, *trustProxy, vault, auto); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -77,12 +85,27 @@ func createAdmin(dbPath, name string) error {
 	return nil
 }
 
+type automationOptions struct {
+	aiMode, model, effort   string
+	autoAnalysis, autopilot bool
+	grace                   time.Duration
+}
+
+func aiCredentialsPresent() bool {
+	for _, k := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"} {
+		if os.Getenv(k) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 type vaultOptions struct {
 	dir, folder string
 	loc         *time.Location
 }
 
-func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA string, interval time.Duration, trustProxy bool, vo vaultOptions) error {
+func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA string, interval time.Duration, trustProxy bool, vo vaultOptions, ao automationOptions) error {
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return err
@@ -110,7 +133,18 @@ func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA
 		fmt.Fprintf(os.Stderr, "\n  Bootstrap admin created. API token (shown only once):\n\n    %s\n\n", tok)
 	}
 
-	srv := server.New(server.Config{HeartbeatInterval: interval, RequireClientCert: clientCA != "", TrustProxy: trustProxy}, st, pol, log)
+	srv := server.New(server.Config{HeartbeatInterval: interval, RequireClientCert: clientCA != "", TrustProxy: trustProxy, AutoAnalysis: ao.autoAnalysis}, st, pol, log)
+	switch {
+	case ao.aiMode == "on" || (ao.aiMode == "auto" && aiCredentialsPresent()):
+		srv.SetAI(ai.NewClaude(ai.ClaudeConfig{Model: ao.model, Effort: ao.effort}))
+		log.Info("AI operator enabled", "model", ao.model, "effort", ao.effort, "auto_analysis", ao.autoAnalysis)
+	case ao.aiMode == "auto":
+		log.Info("AI operator disabled: no Anthropic credentials (set ANTHROPIC_API_KEY)")
+	}
+	if ao.autopilot {
+		srv.EnableAutopilot(ctx, server.AutopilotConfig{Grace: ao.grace})
+		log.Info("autopilot enabled", "grace", ao.grace)
+	}
 	go srv.Run(ctx)
 
 	if vo.dir != "" {

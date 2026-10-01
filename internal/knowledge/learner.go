@@ -24,6 +24,34 @@ type Learner struct {
 	log *slog.Logger
 	// OnChange is called after new diary entries were written.
 	OnChange func()
+	// OnSignal receives structured observations that automation (autopilot,
+	// automatic AI analysis) can react to. Called synchronously; keep it fast.
+	OnSignal func(Signal)
+}
+
+// Signal kinds.
+const (
+	SignalServiceStopped = "service_stopped" // automatic/role-critical service stopped
+	SignalDiskCritical   = "disk_critical"   // a disk crossed the critical threshold
+	SignalCriticalEvent  = "critical_event"  // a Critical event log entry
+	SignalOffline        = "offline"         // agent stopped reporting
+)
+
+// Signal is a structured observation about a server.
+type Signal struct {
+	Kind     string
+	ServerID string
+	Hostname string
+	Service  string // service_stopped
+	Disk     string // disk_critical
+	Title    string // human readable summary (as in the diary)
+	Detail   string
+}
+
+func (l *Learner) signal(sig Signal) {
+	if l.OnSignal != nil {
+		l.OnSignal(sig)
+	}
 }
 
 func NewLearner(st *store.Store, log *slog.Logger) *Learner {
@@ -83,15 +111,16 @@ func (l *Learner) Observe(ctx context.Context, prev *store.Server, hb *protocol.
 	_, _ = l.st.SetFact(ctx, id, "status", "online")
 
 	roles := DetectRoles(hb)
+	host := hb.System.Hostname
 	if first {
 		l.add(ctx, id, store.CatInventory, store.SevInfo, "Inventar erfasst", inventorySummary(hb, roles))
 	} else {
 		l.compareSystem(ctx, id, &old, hb)
-		l.compareServices(ctx, id, &old, hb)
+		l.compareServices(ctx, id, host, &old, hb)
 	}
 	l.learnRoles(ctx, id, roles, first)
-	l.learnDisks(ctx, id, hb, first)
-	l.learnEvents(ctx, id, hb.Events)
+	l.learnDisks(ctx, id, host, hb, first)
+	l.learnEvents(ctx, id, host, hb.Events)
 	l.learnDependencies(ctx, prev, hb, fleet)
 	l.changed()
 }
@@ -158,7 +187,7 @@ func (l *Learner) compareSystem(ctx context.Context, id string, old, hb *protoco
 	}
 }
 
-func (l *Learner) compareServices(ctx context.Context, id string, old, hb *protocol.Heartbeat) {
+func (l *Learner) compareServices(ctx context.Context, id, host string, old, hb *protocol.Heartbeat) {
 	if len(old.Services) == 0 || len(hb.Services) == 0 {
 		return // no inventory on one side (Linux agent, collection failure)
 	}
@@ -179,7 +208,9 @@ func (l *Learner) compareServices(ctx context.Context, id string, old, hb *proto
 		relevant := (IsAutoStart(s.StartType) && !BenignStoppedServices[key]) || IsRoleCritical(s.Name)
 		switch {
 		case p.Status == "Running" && s.Status == "Stopped" && relevant:
-			l.add(ctx, id, store.CatService, store.SevCrit, "Dienst gestoppt: "+s.Name, label(s)+" (Starttyp "+s.StartType+") ist nicht mehr aktiv.")
+			title, detail := "Dienst gestoppt: "+s.Name, label(s)+" (Starttyp "+s.StartType+") ist nicht mehr aktiv."
+			l.add(ctx, id, store.CatService, store.SevCrit, title, detail)
+			l.signal(Signal{Kind: SignalServiceStopped, ServerID: id, Hostname: host, Service: s.Name, Title: title, Detail: detail})
 		case p.Status == "Stopped" && s.Status == "Running" && relevant:
 			l.add(ctx, id, store.CatService, store.SevOK, "Dienst läuft wieder: "+s.Name, label(s))
 		}
@@ -246,7 +277,7 @@ func diskLevel(d protocol.Disk) (string, float64) {
 	return "ok", pct
 }
 
-func (l *Learner) learnDisks(ctx context.Context, id string, hb *protocol.Heartbeat, first bool) {
+func (l *Learner) learnDisks(ctx context.Context, id, host string, hb *protocol.Heartbeat, first bool) {
 	known, err := l.st.Facts(ctx, id, "disk:")
 	if err != nil {
 		return
@@ -263,6 +294,9 @@ func (l *Learner) learnDisks(ctx context.Context, id string, hb *protocol.Heartb
 		prevLevel, existed := was[key]
 		_, _ = l.st.SetFact(ctx, id, key, level)
 		desc := fmt.Sprintf("%s ist zu %.0f %% belegt (%s frei von %s).", d.Name, pct, GB(d.Free), GB(d.Total))
+		if level == "crit" && prevLevel != "crit" {
+			defer l.signal(Signal{Kind: SignalDiskCritical, ServerID: id, Hostname: host, Disk: d.Name, Title: "Datenträger " + d.Name + " fast voll", Detail: desc})
+		}
 		switch {
 		case !existed && !first:
 			l.add(ctx, id, store.CatResource, store.SevInfo, "Neuer Datenträger: "+d.Name, fmt.Sprintf("%s %s, %s", d.Label, d.FS, GB(d.Total)))
@@ -293,7 +327,7 @@ func sevFor(level string) string {
 	return store.SevWarn
 }
 
-func (l *Learner) learnEvents(ctx context.Context, id string, events []protocol.Event) {
+func (l *Learner) learnEvents(ctx context.Context, id, host string, events []protocol.Event) {
 	type sig struct {
 		source string
 		id     int
@@ -311,7 +345,9 @@ func (l *Learner) learnEvents(ctx context.Context, id string, events []protocol.
 		}
 		if e.Level == "Critical" && critical < maxCriticalEntries {
 			critical++
-			l.add(ctx, id, store.CatEvent, store.SevCrit, fmt.Sprintf("Kritisches Ereignis: %s (ID %d)", e.Source, e.EventID), firstLines(e.Message, 6))
+			title := fmt.Sprintf("Kritisches Ereignis: %s (ID %d)", e.Source, e.EventID)
+			l.add(ctx, id, store.CatEvent, store.SevCrit, title, firstLines(e.Message, 6))
+			l.signal(Signal{Kind: SignalCriticalEvent, ServerID: id, Hostname: host, Title: title, Detail: firstLines(e.Message, 6)})
 		}
 		k := fmt.Sprintf("errsig:%s|%d", e.Source, e.EventID)
 		if s, ok := sigs[k]; ok {
@@ -423,8 +459,9 @@ func (l *Learner) CheckAvailability(ctx context.Context, servers []*store.Server
 			continue
 		}
 		_, _ = l.st.SetFact(ctx, s.ID, "status", "offline|"+strconv.FormatInt(s.LastSeen.UnixMilli(), 10))
-		l.add(ctx, s.ID, store.CatAvailability, store.SevCrit, "Nicht mehr erreichbar",
-			"Der Agent meldet sich seit "+s.LastSeen.Local().Format("02.01.2006 15:04")+" nicht mehr (Server aus, Netzwerkproblem oder Agent gestoppt).")
+		detail := "Der Agent meldet sich seit " + s.LastSeen.Local().Format("02.01.2006 15:04") + " nicht mehr (Server aus, Netzwerkproblem oder Agent gestoppt)."
+		l.add(ctx, s.ID, store.CatAvailability, store.SevCrit, "Nicht mehr erreichbar", detail)
+		l.signal(Signal{Kind: SignalOffline, ServerID: s.ID, Hostname: s.Hostname, Title: "Nicht mehr erreichbar", Detail: detail})
 		changed = true
 	}
 	if changed {

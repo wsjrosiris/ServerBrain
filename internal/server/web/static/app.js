@@ -140,6 +140,7 @@ async function boot() {
   state.me = await api("GET", "/api/me");
   try { sessionStorage.setItem("sb_token", state.token); } catch (_) { /* ignore */ }
   state.catalog = await api("GET", "/api/actions");
+  try { state.ai = await api("GET", "/api/assistant/status"); } catch (_) { state.ai = { enabled: false }; }
   document.getElementById("nav").hidden = false;
   for (const el of document.querySelectorAll(".admin-only")) el.hidden = !isAdmin();
   document.getElementById("whoami").replaceChildren(
@@ -168,11 +169,11 @@ function route() {
   if (!state.token) return renderLogin();
   closeModal();
   const hash = location.hash.replace(/^#/, "") || "/";
-  const parts = hash.split("/").filter(Boolean);
+  const parts = hash.split("?")[0].split("/").filter(Boolean);
   const name = parts[0] || "overview";
   for (const a of document.querySelectorAll("nav a")) a.classList.toggle("active", a.dataset.route === (name === "servers" ? "overview" : name));
   clearInterval(state.timer);
-  const views = { overview: viewOverview, servers: () => viewServer(parts[1]), approvals: viewApprovals, journal: viewJournal, commands: viewCommands, events: viewEvents, audit: viewAudit, settings: viewSettings };
+  const views = { overview: viewOverview, servers: () => viewServer(parts[1]), approvals: viewApprovals, journal: viewJournal, assistant: () => viewAssistant(parts[1]), commands: viewCommands, events: viewEvents, audit: viewAudit, settings: viewSettings };
   (views[name] || viewOverview)();
 }
 window.addEventListener("hashchange", route);
@@ -205,7 +206,16 @@ function renderAlert(a) {
     sev(a.severity),
     h("a", { href: "#/servers/" + a.server_id }, h("strong", {}, a.hostname)),
     h("span", { class: "msg" }, a.message),
-    a.suggested && canOperate() ? h("button", { class: "small", onclick: () => actionDialog(a.server_id, a.hostname, a.suggested.action, a.suggested.params, a.message) }, a.suggested.label) : null);
+    a.suggested && canOperate() ? h("button", { class: "small", onclick: () => actionDialog(a.server_id, a.hostname, a.suggested.action, a.suggested.params, a.message) }, a.suggested.label) : null,
+    state.ai && state.ai.enabled ? h("button", { class: "small ai", title: "Ursache von der KI analysieren lassen (Explain & Fix)", onclick: () =>
+      askAI(`Analysiere diesen Alert auf ${a.hostname}: „${a.message}“. Finde die Ursache und schlage eine Lösung vor.`, a.server_id) }, "✨ KI-Diagnose") : null);
+}
+
+async function askAI(question, serverId) {
+  try {
+    const run = await api("POST", "/api/assistant", { question, server_id: serverId || "" });
+    location.hash = "#/assistant/" + run.id;
+  } catch (e) { alert(e.message); }
 }
 
 function serverCard(s) {
@@ -245,7 +255,9 @@ async function viewServer(id) {
     const sys = (server.snapshot && server.snapshot.system) || {};
     head.replaceChildren(
       h("h1", { class: "row" }, h("span", { class: "dot " + (server.online ? "on" : "off") }), server.hostname,
-        (server.tags || []).map((t) => h("span", { class: "tag" }, t))),
+        (server.tags || []).map((t) => h("span", { class: "tag" }, t)),
+        state.ai && state.ai.enabled ? h("span", { class: "spacer" }) : null,
+        state.ai && state.ai.enabled ? h("button", { class: "small ai", onclick: () => { location.hash = "#/assistant?server=" + server.id; } }, "✨ KI fragen") : null),
       h("p", { class: "muted" }, [server.os_version || server.os, sys.domain, "Agent " + server.agent_version, (sys.ips || []).join(", "), "zuletzt " + ago(server.last_seen)].filter(Boolean).join(" · ")),
       tabBar);
     if (tab === "overview") renderTab();
@@ -602,11 +614,149 @@ function commandsTable(cmds, withHost) {
       h("td", { class: "small" }, c.requested_by + (c.actor_type === "ai" ? " (KI)" : ""))))));
 }
 
+// ---------- AI assistant ----------
+
+// md renders the small Markdown subset the assistant uses into DOM nodes
+// (headings, lists, code blocks, bold, inline code) - never via innerHTML.
+function mdInline(text) {
+  const out = [];
+  const re = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(m[0].startsWith("**") ? h("strong", {}, m[0].slice(2, -2)) : h("code", {}, m[0].slice(1, -1)));
+    last = re.lastIndex;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+function md(text) {
+  const root = h("div", { class: "md" });
+  const lines = (text || "").replace(/\r\n/g, "\n").split("\n");
+  let list = null, para = [];
+  const flushPara = () => { if (para.length) { root.append(h("p", {}, mdInline(para.join(" ")))); para = []; } };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim().startsWith("```")) {
+      flushPara(); list = null;
+      const code = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith("```"); i++) code.push(lines[i]);
+      root.append(h("pre", {}, code.join("\n")));
+      continue;
+    }
+    const head = line.match(/^(#{1,4})\s+(.*)$/);
+    const ul = line.match(/^\s*[-*]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (head) { flushPara(); list = null; root.append(h("h4", {}, mdInline(head[2]))); }
+    else if (ul || ol) {
+      flushPara();
+      const tag = ul ? "ul" : "ol";
+      if (!list || list.tagName.toLowerCase() !== tag) { list = h(tag); root.append(list); }
+      list.append(h("li", {}, mdInline((ul || ol)[1])));
+    } else if (!line.trim()) { flushPara(); list = null; }
+    else { list = null; para.push(line.trim()); }
+  }
+  flushPara();
+  return root;
+}
+
+const stepIcons = { tool: "🔧", result: "↳", status: "💭", error: "⚠️" };
+
+async function viewAssistant(arg) {
+  if (!state.ai || !state.ai.enabled) {
+    setView(h("h1", {}, "KI-Assistent"), h("div", { class: "panel" },
+      h("p", {}, "Der KI-Operator ist nicht aktiv. Setze ", h("code", {}, "ANTHROPIC_API_KEY"), " in der Umgebung von sb-server und starte ihn neu."),
+      h("p", { class: "muted" }, "Monitoring, Tagebuch, Obsidian-Vault und Autopilot funktionieren auch ohne KI.")));
+    return;
+  }
+  const [runId, query] = (arg || "").split("?");
+  const params = new URLSearchParams(query || (location.hash.split("?")[1] || ""));
+  const list = h("div", { class: "run-list" });
+  const main = h("div", { class: "run-main" });
+  setView(h("h1", {}, "KI-Assistent ", h("span", { class: "muted small" }, state.ai.model)), h("div", { class: "assistant" }, list, main));
+
+  const servers = await api("GET", "/api/servers").catch(() => []);
+  async function loadList() {
+    try {
+      const runs = await api("GET", "/api/assistant");
+      list.replaceChildren(
+        h("button", { class: "primary", onclick: () => { location.hash = "#/assistant"; } }, "+ Neue Frage"),
+        ...runs.map((r) => h("a", { class: "run-item" + (r.id === runId ? " active" : ""), href: "#/assistant/" + r.id },
+          h("div", {}, r.origin === "auto" ? h("span", { class: "tag" }, "automatisch") : null, r.title),
+          h("div", { class: "muted small" }, [r.hostname, ago(r.created_at), r.status === "running" ? "läuft…" : r.status === "error" ? "Fehler" : ""].filter(Boolean).join(" · ")))));
+    } catch (_) { /* ignore */ }
+  }
+  loadList();
+  every(15000, loadList);
+
+  if (!runId) {
+    const q = h("textarea", { rows: "3", placeholder: "z. B. „Warum ist WEB-03 langsam?“, „Welche Server haben weniger als 10 GB frei?“, „Warum erreicht APP-03 den SQL-Server nicht?“" });
+    const srvSel = h("select", {}, h("option", { value: "" }, "alle Server / Flotte"), servers.map((sv) => h("option", { value: sv.id, selected: sv.id === params.get("server") }, sv.hostname)));
+    const go = () => { if (q.value.trim()) askAI(q.value.trim(), srvSel.value); };
+    q.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); go(); } });
+    main.replaceChildren(h("div", { class: "panel" },
+      h("h2", {}, "Was möchtest du wissen?"),
+      h("p", { class: "muted" }, "Die KI liest das gelernte Wissen, das Servertagebuch und die Ereignisse, führt Read-only-Diagnosen über die Agenten aus und schlägt Lösungen vor. Ändernde Aktionen fordert sie über die Policy an – riskante brauchen deine Freigabe."),
+      q, h("div", { class: "row decision" }, srvSel, h("button", { class: "primary", onclick: go }, "Fragen")),
+      h("div", { class: "examples" }, ["Gib mir einen Überblick über den Zustand aller Server.", "Welche Server haben kritische Alerts und warum?", "Welche Abhängigkeiten hat der SQL-Server?"]
+        .map((ex) => h("button", { class: "small", onclick: () => { q.value = ex; q.focus(); } }, ex)))));
+    q.focus();
+    return;
+  }
+
+  const transcript = h("div", { class: "transcript" });
+  const follow = h("textarea", { rows: "2", placeholder: "Folgefrage…" });
+  const sendBtn = h("button", { class: "primary" }, "Senden");
+  const footer = h("div", { class: "row decision" }, follow, sendBtn);
+  const header = h("div", { class: "row" });
+  main.replaceChildren(h("div", { class: "panel" }, header, transcript, footer));
+  let next = 0, status = "running", stop = false, owner = "";
+
+  function renderStep(st) {
+    if (st.kind === "question") return h("div", { class: "msg-q" }, st.title);
+    if (st.kind === "answer") return h("div", { class: "msg-a" }, md(st.detail));
+    if (st.kind === "result") return h("details", { class: "step step-result" + (st.ok ? "" : " bad") }, h("summary", {}, stepIcons.result + " " + st.title), h("pre", {}, st.detail || ""));
+    return h("div", { class: "step step-" + st.kind }, (stepIcons[st.kind] || "") + " " + st.title, st.kind === "error" && st.detail ? h("div", { class: "muted small" }, st.detail) : null);
+  }
+  function renderHeader(run) {
+    owner = run.owner;
+    header.replaceChildren(
+      h("h2", {}, run.title),
+      h("span", { class: "spacer" }),
+      run.hostname ? h("a", { href: "#/servers/" + run.server_id }, run.hostname) : null,
+      sev(run.status === "running" ? "analysiert…" : run.status === "error" ? "Fehler" : "fertig", run.status === "running" ? "dispatched" : run.status === "error" ? "failed" : "succeeded"));
+    const canAsk = run.status !== "running" && owner === state.me.name;
+    footer.hidden = owner !== state.me.name;
+    follow.disabled = sendBtn.disabled = !canAsk;
+  }
+  async function poll() {
+    while (!stop && main.isConnected) {
+      try {
+        const res = await api("GET", `/api/assistant/${runId}/steps?after=${next}`);
+        for (const st of res.steps) transcript.append(renderStep(st));
+        if (res.steps.length) transcript.lastChild.scrollIntoView({ block: "nearest" });
+        next = res.next; status = res.run.status;
+        renderHeader(res.run);
+        if (status !== "running") loadList();
+      } catch (e) { transcript.append(errorBox(e)); return; }
+    }
+  }
+  const sendFollow = async () => {
+    if (!follow.value.trim()) return;
+    try { await api("POST", `/api/assistant/${runId}/ask`, { question: follow.value.trim() }); follow.value = ""; }
+    catch (e) { alert(e.message); }
+  };
+  sendBtn.addEventListener("click", sendFollow);
+  follow.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFollow(); } });
+  poll();
+}
+
 // ---------- knowledge & diary ----------
 
 const sevIcons = { crit: "🔴", warn: "🟠", ok: "🟢", info: "🔹" };
 const catLabels = { inventar: "Inventar", verfuegbarkeit: "Verfügbarkeit", dienst: "Dienst", software: "Software", rolle: "Rolle", ressource: "Ressource",
-  ereignis: "Ereignis", system: "System", netzwerk: "Netzwerk", aktion: "Aktion", konsole: "Konsole", notiz: "Notiz" };
+  ereignis: "Ereignis", system: "System", netzwerk: "Netzwerk", aktion: "Aktion", konsole: "Konsole", notiz: "Notiz", ki: "KI", autopilot: "Autopilot" };
 
 async function apiText(path) {
   const res = await fetch(path, { headers: { "Authorization": "Bearer " + state.token } });

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/wsjrosiris/serverbrain/internal/actions"
+	"github.com/wsjrosiris/serverbrain/internal/ai"
 	"github.com/wsjrosiris/serverbrain/internal/knowledge"
 	"github.com/wsjrosiris/serverbrain/internal/policy"
 	"github.com/wsjrosiris/serverbrain/internal/protocol"
@@ -39,6 +40,9 @@ type Config struct {
 	DispatchTTL      time.Duration
 	MetricsRetention time.Duration
 	EventsRetention  time.Duration
+	// AutoAnalysis lets the AI analyse critical incidents on its own.
+	AutoAnalysis         bool
+	AutoAnalysisInterval time.Duration // per server, default 30 min
 }
 
 func (c *Config) defaults() {
@@ -74,12 +78,18 @@ type Server struct {
 	sessions *sessionHub
 	learner  *knowledge.Learner
 	vault    *knowledge.Vault // nil when no Obsidian vault is configured
+
+	ai        ai.Provider // nil when no LLM is configured
+	assistant *assistantHub
+	autopilot *Autopilot // nil when disabled
 }
 
 func New(cfg Config, st *store.Store, pol *policy.Policy, log *slog.Logger) *Server {
 	cfg.defaults()
-	return &Server{cfg: cfg, store: st, policy: pol, log: log, waiters: map[string]chan struct{}{}, sessions: newSessionHub(),
-		learner: knowledge.NewLearner(st, log)}
+	srv := &Server{cfg: cfg, store: st, policy: pol, log: log, waiters: map[string]chan struct{}{}, sessions: newSessionHub(),
+		learner: knowledge.NewLearner(st, log), assistant: newAssistantHub()}
+	srv.learner.OnSignal = srv.onSignal
+	return srv
 }
 
 // SetVault enables rendering knowledge into an Obsidian vault.
@@ -120,6 +130,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sid}/approve", s.userAuth(policy.RoleAdmin, s.handleSessionDecide(true)))
 	mux.HandleFunc("POST /api/sessions/{sid}/reject", s.userAuth(policy.RoleAdmin, s.handleSessionDecide(false)))
 	mux.HandleFunc("GET /api/events", s.userAuth(policy.RoleViewer, s.handleEvents))
+	mux.HandleFunc("GET /api/assistant/status", s.userAuth(policy.RoleViewer, s.handleAssistantStatus))
+	mux.HandleFunc("GET /api/assistant", s.userAuth(policy.RoleViewer, s.handleAssistantList))
+	mux.HandleFunc("POST /api/assistant", s.userAuth(policy.RoleViewer, s.handleAssistantStart))
+	mux.HandleFunc("POST /api/assistant/{rid}/ask", s.userAuth(policy.RoleViewer, s.handleAssistantAsk))
+	mux.HandleFunc("GET /api/assistant/{rid}/steps", s.userAuth(policy.RoleViewer, s.handleAssistantSteps))
 	mux.HandleFunc("GET /api/journal", s.userAuth(policy.RoleViewer, s.handleJournal))
 	mux.HandleFunc("POST /api/journal", s.userAuth(policy.RoleOperator, s.handleAddJournal))
 	mux.HandleFunc("POST /api/servers/{id}/journal", s.userAuth(policy.RoleOperator, s.handleAddJournal))
@@ -159,6 +174,7 @@ func (s *Server) Run(ctx context.Context) {
 		case <-t.C:
 		}
 		s.maintainSessions(ctx)
+		s.forgetOldRuns()
 		if list, err := s.store.ListServers(ctx, false); err == nil {
 			s.learner.CheckAvailability(ctx, list, 3*s.cfg.HeartbeatInterval)
 		}
@@ -552,10 +568,25 @@ type evaluated struct {
 	decision policy.Decision
 }
 
+// Actor is whoever requests an action: a person, the AI acting for a
+// person, or the autopilot. Humans, AI and autopilot share one pipeline, so
+// policy, approvals, audit and the diary apply identically to all of them.
+type Actor struct {
+	Name string
+	Kind string // policy.ActorHuman or policy.ActorAI
+	Role string
+}
+
+func actorOf(u *store.User) Actor { return Actor{Name: u.Name, Kind: u.Kind, Role: u.Role} }
+
 // evaluate validates an action request against the catalog, the target's
 // advertised capabilities and the policy.
 func (s *Server) evaluate(r *http.Request, req actionRequest) (*evaluated, int, error) {
-	srv, err := s.store.GetServer(r.Context(), r.PathValue("id"))
+	return s.evaluateFor(r.Context(), actorOf(userFrom(r)), r.PathValue("id"), req)
+}
+
+func (s *Server) evaluateFor(ctx context.Context, actor Actor, serverID string, req actionRequest) (*evaluated, int, error) {
+	srv, err := s.store.GetServer(ctx, serverID)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, http.StatusNotFound, errors.New("server not found")
 	}
@@ -577,12 +608,44 @@ func (s *Server) evaluate(r *http.Request, req actionRequest) (*evaluated, int, 
 	if err != nil {
 		return nil, http.StatusBadRequest, err
 	}
-	u := userFrom(r)
-	dec := s.policy.Evaluate(policy.Request{Action: def, Hostname: srv.Hostname, Tags: srv.Tags, ActorType: u.Kind, Role: u.Role})
-	if u.Role == policy.RoleViewer && !def.ReadOnly {
+	dec := s.policy.Evaluate(policy.Request{Action: def, Hostname: srv.Hostname, Tags: srv.Tags, ActorType: actor.Kind, Role: actor.Role})
+	if actor.Role == policy.RoleViewer && !def.ReadOnly {
 		dec = policy.Decision{Effect: policy.Block, Rule: "rbac", Reason: "viewers may only run read-only actions"}
 	}
 	return &evaluated{srv: srv, def: def, params: params, preview: def.Preview(srv.OS, params), decision: dec}, 0, nil
+}
+
+// requestAction runs the complete request pipeline: validation, policy,
+// command creation (queued or pending approval), audit and agent wake-up.
+// A blocked request returns the decision with status 403 and no command.
+func (s *Server) requestAction(ctx context.Context, actor Actor, serverID string, req actionRequest) (*store.Command, policy.Decision, int, error) {
+	ev, status, err := s.evaluateFor(ctx, actor, serverID, req)
+	if err != nil {
+		return nil, policy.Decision{}, status, err
+	}
+	details := map[string]any{"action": ev.def.Name, "params": ev.params, "reason": req.Reason, "rule": ev.decision.Rule, "effect": ev.decision.Effect}
+	if ev.decision.Effect == policy.Block {
+		_ = s.store.Audit(ctx, actor.Name, actor.Kind, "action.blocked", ev.srv.ID, details)
+		return nil, ev.decision, http.StatusForbidden, errors.New("blocked by policy")
+	}
+	cmd := &store.Command{
+		ServerID: ev.srv.ID, Action: ev.def.Name, Params: ev.params, Preview: ev.preview, Risk: string(ev.def.Risk),
+		RequestedBy: actor.Name, ActorType: actor.Kind, Reason: req.Reason, PolicyRule: ev.decision.Rule,
+		Status: store.StatusQueued,
+	}
+	if ev.decision.Effect == policy.Approve {
+		cmd.Status = store.StatusPendingApproval
+	}
+	if err := s.store.CreateCommand(ctx, cmd); err != nil {
+		return nil, ev.decision, http.StatusInternalServerError, err
+	}
+	details["command"] = cmd.ID
+	_ = s.store.Audit(ctx, actor.Name, actor.Kind, "action.requested", ev.srv.ID, details)
+	if cmd.Status == store.StatusQueued {
+		s.wake(ev.srv.ID)
+	}
+	cmd.Hostname = ev.srv.Hostname
+	return cmd, ev.decision, http.StatusAccepted, nil
 }
 
 func (s *Server) handlePreviewAction(w http.ResponseWriter, r *http.Request) {
@@ -611,41 +674,17 @@ func (s *Server) handleRequestAction(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	u := userFrom(r)
-	ev, status, err := s.evaluate(r, req)
-	if err != nil {
-		if status == http.StatusInternalServerError {
-			s.internalErr(w, err)
-			return
-		}
-		writeErr(w, status, err.Error())
-		return
-	}
-	details := map[string]any{"action": ev.def.Name, "params": ev.params, "reason": req.Reason, "rule": ev.decision.Rule, "effect": ev.decision.Effect}
-	if ev.decision.Effect == policy.Block {
-		_ = s.store.Audit(r.Context(), u.Name, u.Kind, "action.blocked", ev.srv.ID, details)
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": "blocked by policy", "decision": ev.decision})
-		return
-	}
-	cmd := &store.Command{
-		ServerID: ev.srv.ID, Action: ev.def.Name, Params: ev.params, Preview: ev.preview, Risk: string(ev.def.Risk),
-		RequestedBy: u.Name, ActorType: u.Kind, Reason: req.Reason, PolicyRule: ev.decision.Rule,
-		Status: store.StatusQueued,
-	}
-	if ev.decision.Effect == policy.Approve {
-		cmd.Status = store.StatusPendingApproval
-	}
-	if err := s.store.CreateCommand(r.Context(), cmd); err != nil {
+	cmd, dec, status, err := s.requestAction(r.Context(), actorOf(userFrom(r)), r.PathValue("id"), req)
+	switch {
+	case status == http.StatusForbidden:
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "blocked by policy", "decision": dec})
+	case status == http.StatusInternalServerError:
 		s.internalErr(w, err)
-		return
+	case err != nil:
+		writeErr(w, status, err.Error())
+	default:
+		writeJSON(w, http.StatusAccepted, map[string]any{"command": cmd, "decision": dec})
 	}
-	details["command"] = cmd.ID
-	_ = s.store.Audit(r.Context(), u.Name, u.Kind, "action.requested", ev.srv.ID, details)
-	if cmd.Status == store.StatusQueued {
-		s.wake(ev.srv.ID)
-	}
-	cmd.Hostname = ev.srv.Hostname
-	writeJSON(w, http.StatusAccepted, map[string]any{"command": cmd, "decision": ev.decision})
 }
 
 func (s *Server) handleListCommands(w http.ResponseWriter, r *http.Request) {

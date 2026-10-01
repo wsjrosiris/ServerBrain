@@ -83,9 +83,17 @@ func fakeClaude(args []string) int {
 		json.NewDecoder(resp.Body).Decode(&out)
 		return out
 	}
+	// Like Claude Code, sessions live per working directory: a resumed
+	// session must be found in the same directory.
 	session := "sess-1"
-	if flags["--resume"] == "sess-1" {
+	if r := flags["--resume"]; r != "" {
+		if _, err := os.Stat("session-" + r); err != nil {
+			return fail("No conversation found with session ID: " + r)
+		}
 		session = "sess-2"
+	}
+	if err := os.WriteFile("session-"+session, []byte("x"), 0o600); err != nil {
+		return fail(err.Error())
 	}
 	emit(map[string]any{"type": "system", "subtype": "init", "session_id": session, "mcp_servers": []any{map[string]any{"name": "serverbrain", "status": "connected"}}})
 	init := rpc("initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "fake-claude"}})
@@ -125,6 +133,7 @@ func TestClaudeCodeBackendUsesSubscriptionAndMCP(t *testing.T) {
 	a.srv.SetAI(ai.NewClaudeCode(ai.ClaudeCodeConfig{
 		Command: []string{os.Args[0]}, Env: []string{"SB_FAKE_CLAUDE=1"},
 		OAuthToken: "sk-ant-oat-test", UseSubscription: true, Model: "claude-opus-5-5", Effort: "high",
+		Dir: t.TempDir(),
 	}))
 
 	_, status := a.call(a.admin, http.MethodGet, "/api/assistant/status", nil)
@@ -177,7 +186,7 @@ func TestClaudeCodeBackendUsesSubscriptionAndMCP(t *testing.T) {
 	}
 	_, steps = a.waitRun(a.admin, run["id"].(string))
 	if last := steps[len(steps)-1]; last["kind"] != "answer" {
-		t.Fatalf("follow-up steps: %v", steps)
+		t.Fatalf("follow-up did not resume the session: %v", steps[len(steps)-1])
 	}
 
 	// The MCP endpoint rejects anything without a live run token.

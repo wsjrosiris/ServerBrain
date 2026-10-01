@@ -630,7 +630,7 @@ const incStatus = {
   failed: ["nicht behoben", "failed"], resolved: ["behoben", "succeeded"], dismissed: ["verworfen", "cancelled"],
 };
 const stepStatus = { pending: "offen", running: "läuft…", waiting_approval: "wartet auf Freigabe", succeeded: "erfolgreich", failed: "fehlgeschlagen",
-  blocked: "gesperrt", skipped: "übersprungen", timeout: "Zeitüberschreitung", rejected: "abgelehnt", expired: "abgelaufen", cancelled: "abgebrochen" };
+  blocked: "gesperrt", skipped: "übersprungen", interrupted: "unterbrochen", timeout: "Zeitüberschreitung", rejected: "abgelehnt", expired: "abgelaufen", cancelled: "abgebrochen" };
 const effectText = { allow: "läuft sofort", approve: "braucht Freigabe", block: "für dich gesperrt" };
 
 function incStatusBadge(st) {

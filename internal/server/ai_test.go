@@ -200,6 +200,10 @@ func newAIEnv(t *testing.T, ctx context.Context, cfg server.Config, autopilot bo
 }
 
 func newAIEnvOpt(t *testing.T, ctx context.Context, cfg server.Config, autopilot, withAI bool) *aiEnv {
+	return newAIEnvPolicy(t, ctx, cfg, autopilot, withAI, policy.Default())
+}
+
+func newAIEnvPolicy(t *testing.T, ctx context.Context, cfg server.Config, autopilot, withAI bool, pol *policy.Policy) *aiEnv {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	st, err := store.Open(filepath.Join(t.TempDir(), "sb.db"))
 	if err != nil {
@@ -210,7 +214,7 @@ func newAIEnvOpt(t *testing.T, ctx context.Context, cfg server.Config, autopilot
 		cfg.HeartbeatInterval = 5 * time.Second
 	}
 	cfg.LongPollTimeout = time.Second
-	srv := server.New(cfg, st, policy.Default(), log)
+	srv := server.New(cfg, st, pol, log)
 	llm := &scriptLLM{}
 	if withAI {
 		srv.SetAI(llm)

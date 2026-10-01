@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -115,6 +116,16 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema + schemaKnowledge + schemaIncidents); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	// Columns added after the first release; ALTER fails harmlessly when
+	// the column already exists.
+	for _, alter := range []string{
+		`ALTER TABLE commands ADD COLUMN on_behalf_of TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -532,6 +543,7 @@ type Command struct {
 	Status      string                  `json:"status"`
 	RequestedBy string                  `json:"requested_by"`
 	ActorType   string                  `json:"actor_type"`
+	OnBehalfOf  string                  `json:"on_behalf_of,omitempty"` // the person an AI acted for
 	Reason      string                  `json:"reason"`
 	PolicyRule  string                  `json:"policy_rule"`
 	DecidedBy   string                  `json:"decided_by,omitempty"`
@@ -543,18 +555,18 @@ type Command struct {
 func (s *Store) CreateCommand(ctx context.Context, c *Command) error {
 	now := time.Now().UTC()
 	c.ID, c.CreatedAt, c.UpdatedAt = NewID(), now, now
-	_, err := s.db.ExecContext(ctx, `INSERT INTO commands(id,server_id,action,params,preview,risk,status,requested_by,actor_type,reason,policy_rule,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.ServerID, c.Action, mustJSON(c.Params), c.Preview, c.Risk, c.Status, c.RequestedBy, c.ActorType, c.Reason, c.PolicyRule, unix(now), unix(now))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO commands(id,server_id,action,params,preview,risk,status,requested_by,actor_type,on_behalf_of,reason,policy_rule,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.ServerID, c.Action, mustJSON(c.Params), c.Preview, c.Risk, c.Status, c.RequestedBy, c.ActorType, c.OnBehalfOf, c.Reason, c.PolicyRule, unix(now), unix(now))
 	return err
 }
 
-const commandCols = `c.id,c.server_id,COALESCE(s.hostname,''),c.action,c.params,c.preview,c.risk,c.status,c.requested_by,c.actor_type,c.reason,c.policy_rule,c.decided_by,c.result,c.created_at,c.updated_at`
+const commandCols = `c.id,c.server_id,COALESCE(s.hostname,''),c.action,c.params,c.preview,c.risk,c.status,c.requested_by,c.actor_type,c.on_behalf_of,c.reason,c.policy_rule,c.decided_by,c.result,c.created_at,c.updated_at`
 
 func scanCommand(sc interface{ Scan(...any) error }) (*Command, error) {
 	var c Command
 	var params, result string
 	var created, updated int64
-	if err := sc.Scan(&c.ID, &c.ServerID, &c.Hostname, &c.Action, &params, &c.Preview, &c.Risk, &c.Status, &c.RequestedBy, &c.ActorType, &c.Reason, &c.PolicyRule, &c.DecidedBy, &result, &created, &updated); err != nil {
+	if err := sc.Scan(&c.ID, &c.ServerID, &c.Hostname, &c.Action, &params, &c.Preview, &c.Risk, &c.Status, &c.RequestedBy, &c.ActorType, &c.OnBehalfOf, &c.Reason, &c.PolicyRule, &c.DecidedBy, &result, &created, &updated); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(params), &c.Params)

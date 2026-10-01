@@ -171,6 +171,7 @@ func (s *Server) Handler() http.Handler {
 
 // Run executes background maintenance until ctx is done.
 func (s *Server) Run(ctx context.Context) {
+	s.RecoverInterrupted(ctx)
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for i := 0; ; i++ {
@@ -581,6 +582,9 @@ type Actor struct {
 	Name string
 	Kind string // policy.ActorHuman or policy.ActorAI
 	Role string
+	// OnBehalfOf names the person an AI acts for. That person counts as the
+	// requester for the four-eyes rule.
+	OnBehalfOf string
 }
 
 func actorOf(u *store.User) Actor { return Actor{Name: u.Name, Kind: u.Kind, Role: u.Role} }
@@ -636,7 +640,7 @@ func (s *Server) requestAction(ctx context.Context, actor Actor, serverID string
 	}
 	cmd := &store.Command{
 		ServerID: ev.srv.ID, Action: ev.def.Name, Params: ev.params, Preview: ev.preview, Risk: string(ev.def.Risk),
-		RequestedBy: actor.Name, ActorType: actor.Kind, Reason: req.Reason, PolicyRule: ev.decision.Rule,
+		RequestedBy: actor.Name, ActorType: actor.Kind, OnBehalfOf: actor.OnBehalfOf, Reason: req.Reason, PolicyRule: ev.decision.Rule,
 		Status: store.StatusQueued,
 	}
 	if ev.decision.Effect == policy.Approve {
@@ -733,7 +737,7 @@ func (s *Server) handleDecide(approve bool) http.HandlerFunc {
 			s.internalErr(w, err)
 			return
 		}
-		if approve && !s.policy.AllowSelfApproval && c.RequestedBy == u.Name {
+		if approve && !s.policy.AllowSelfApproval && (c.RequestedBy == u.Name || c.OnBehalfOf == u.Name) {
 			writeErr(w, http.StatusForbidden, "four-eyes principle: you cannot approve your own request")
 			return
 		}

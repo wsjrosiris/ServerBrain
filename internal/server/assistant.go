@@ -135,7 +135,7 @@ func aiActorFor(u *store.User) Actor {
 	if role == policy.RoleAdmin {
 		role = policy.RoleOperator
 	}
-	return Actor{Name: "KI für " + u.Name, Kind: policy.ActorAI, Role: role}
+	return Actor{Name: "KI für " + u.Name, Kind: policy.ActorAI, Role: role, OnBehalfOf: u.Name}
 }
 
 // autoActor is used for automatic incident analyses: read-only.
@@ -209,7 +209,7 @@ func (s *Server) processAgent(ctx context.Context, run *Run, runner ai.AgentRunn
 	session := run.agentSession
 	s.assistant.mu.Unlock()
 	res, err := runner.RunAgent(ctx, ai.AgentRequest{
-		System: systemPrompt, Prompt: prompt, SessionID: session, MCPURL: url, MCPToken: tok,
+		ConversationID: run.ID, System: systemPrompt, Prompt: prompt, SessionID: session, MCPURL: url, MCPToken: tok,
 		OnText: func(text string) { s.addStep(run, Step{Kind: "status", Title: oneLine(text, 300)}) },
 	})
 	if res != nil && res.SessionID != "" {
@@ -495,6 +495,9 @@ func (s *Server) forgetOldRuns() {
 	for id, run := range s.assistant.runs {
 		if run.Status != "running" && time.Since(run.UpdatedAt) > runKeep {
 			delete(s.assistant.runs, id)
+			if f, ok := s.ai.(ai.Forgetter); ok {
+				go f.Forget(id)
+			}
 		}
 	}
 }

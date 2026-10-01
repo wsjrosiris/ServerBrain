@@ -74,13 +74,21 @@ type AgentRunner interface {
 }
 
 type AgentRequest struct {
-	System    string
-	Prompt    string
-	SessionID string // continue this agent session (follow-up question)
-	MCPURL    string
-	MCPToken  string
+	// ConversationID identifies the conversation across follow-up turns.
+	ConversationID string
+	System         string
+	Prompt         string
+	SessionID      string // continue this agent session (follow-up question)
+	MCPURL         string
+	MCPToken       string
 	// OnText receives text the model writes between tool calls.
 	OnText func(text string)
+}
+
+// Forgetter is implemented by backends that keep per-conversation state
+// (e.g. a working directory) and must be told when it can be dropped.
+type Forgetter interface {
+	Forget(conversationID string)
 }
 
 type AgentResult struct {

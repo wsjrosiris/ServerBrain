@@ -467,9 +467,9 @@ func (s *Server) executeIncident(inc *store.Incident, u *store.User, selected ma
 			step.Status = "running"
 			s.saveIncidentPlan(ctx, inc)
 		}
-		limit := actionWaitLimit * 5
+		limit := stepWaitLimit(step.Action)
 		if step.Status == "waiting_approval" {
-			limit = approvalWaitPlan
+			limit += approvalWaitPlan
 		}
 		done, err := s.waitCommand(ctx, cmd.ID, limit)
 		if err != nil || done == nil {
@@ -541,6 +541,56 @@ func (s *Server) finishExecution(ctx context.Context, inc *store.Incident, statu
 		title = "Lösung nicht erfolgreich: " + cur.Title
 	}
 	s.incidentNote(ctx, cur, sev, title, resolution, cur.DecidedBy)
+}
+
+// stepWaitLimit is how long a plan step may take: the action's own timeout
+// on the agent plus time for dispatch and result delivery.
+func stepWaitLimit(action string) time.Duration {
+	limit := 5 * time.Minute
+	if def, ok := actions.Get(action); ok && def.TimeoutSeconds > 0 {
+		limit = time.Duration(def.TimeoutSeconds) * time.Second
+	}
+	return limit + 3*time.Minute
+}
+
+// RecoverInterrupted repairs incidents whose in-memory work was lost when
+// the control plane stopped (execution, analysis or an autopilot playbook
+// in flight). Without this they would stay in a state nothing ever leaves.
+func (s *Server) RecoverInterrupted(ctx context.Context) {
+	incidentMu.Lock()
+	list, err := s.store.ListIncidents(ctx, store.IncidentFilter{Open: true, Limit: 1000})
+	if err != nil {
+		incidentMu.Unlock()
+		return
+	}
+	var notes []*store.Incident
+	for _, inc := range list {
+		switch inc.Status {
+		case store.IncExecuting:
+			for i := range inc.Plan {
+				if st := inc.Plan[i].Status; st == "running" || st == "waiting_approval" || st == "pending" {
+					inc.Plan[i].Status = "interrupted"
+				}
+			}
+			inc.Status = store.IncFailed
+			inc.Resolution = "Die Umsetzung wurde durch einen Neustart von ServerBrain unterbrochen. Bitte den Zustand des Servers prüfen (Aktionen/Tagebuch) und die Lösung bei Bedarf erneut umsetzen."
+		case store.IncAnalyzing:
+			inc.Status, inc.Resolution = store.IncNew, "Die Analyse wurde durch einen Neustart von ServerBrain unterbrochen und kann neu gestartet werden."
+		case store.IncAutopilot:
+			inc.Status, inc.Resolution = store.IncNew, "Der Autopilot wurde durch einen Neustart von ServerBrain unterbrochen."
+		default:
+			continue
+		}
+		_ = s.store.SaveIncident(ctx, inc)
+		notes = append(notes, inc)
+	}
+	incidentMu.Unlock()
+	for _, inc := range notes {
+		s.incidentNote(ctx, inc, store.SevWarn, "Vorfall unterbrochen: "+inc.Title, inc.Resolution, "")
+	}
+	if len(notes) > 0 {
+		s.log.Warn("recovered interrupted incidents", "count", len(notes))
+	}
 }
 
 // verifyIncident waits for fresh telemetry and checks the original

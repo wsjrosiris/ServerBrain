@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -44,7 +46,7 @@ type ClaudeCodeConfig struct {
 	// precedence over the subscription.
 	UseSubscription bool
 	MaxTurns        int
-	Dir             string   // working directory (default: a fresh temp dir)
+	Dir             string   // base for per-conversation working directories (default: <tmp>/serverbrain-claude)
 	Env             []string // additional environment variables
 }
 
@@ -145,13 +147,16 @@ func (c *ClaudeCode) RunAgent(ctx context.Context, req AgentRequest) (*AgentResu
 	if err != nil {
 		return nil, err
 	}
-	dir := c.cfg.Dir
-	if dir == "" {
-		// An empty working directory: no project CLAUDE.md, hooks or settings.
-		if dir, err = os.MkdirTemp("", "serverbrain-claude-"); err != nil {
-			return nil, err
-		}
-		defer os.RemoveAll(dir)
+	if err := os.MkdirAll(c.baseDir(), 0o700); err != nil {
+		return nil, err
+	}
+	// Claude Code stores sessions per working directory, so a conversation
+	// keeps one directory for all its turns (otherwise --resume would not
+	// find the session). It starts empty: no project CLAUDE.md, hooks or
+	// settings.
+	dir, err := c.workDir(req.ConversationID)
+	if err != nil {
+		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, c.cfg.Command[0], args...)
 	cmd.Dir, cmd.Env = dir, c.env()
@@ -221,6 +226,31 @@ func (c *ClaudeCode) RunAgent(ctx context.Context, req AgentRequest) (*AgentResu
 		return res, errors.New("Claude Code: " + tail(msg, 800))
 	}
 	return res, nil
+}
+
+var safeID = regexp.MustCompile(`[^A-Za-z0-9_-]`)
+
+func (c *ClaudeCode) baseDir() string {
+	if c.cfg.Dir != "" {
+		return c.cfg.Dir
+	}
+	return filepath.Join(os.TempDir(), "serverbrain-claude")
+}
+
+func (c *ClaudeCode) workDir(conversationID string) (string, error) {
+	id := safeID.ReplaceAllString(conversationID, "")
+	if id == "" {
+		return os.MkdirTemp(c.baseDir(), "run-")
+	}
+	dir := filepath.Join(c.baseDir(), id)
+	return dir, os.MkdirAll(dir, 0o700)
+}
+
+// Forget removes the working directory of a finished conversation.
+func (c *ClaudeCode) Forget(conversationID string) {
+	if id := safeID.ReplaceAllString(conversationID, ""); id != "" {
+		_ = os.RemoveAll(filepath.Join(c.baseDir(), id))
+	}
 }
 
 func tail(s string, n int) string {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/wsjrosiris/serverbrain/internal/actions"
+	"github.com/wsjrosiris/serverbrain/internal/knowledge"
 )
 
 type Alert struct {
@@ -24,15 +25,6 @@ type SuggestedAction struct {
 	Action string            `json:"action"`
 	Params map[string]string `json:"params"`
 	Label  string            `json:"label"`
-}
-
-// Automatic services that are routinely stopped on healthy Windows servers
-// (trigger-started or delayed services that exit when idle).
-var benignStoppedServices = map[string]bool{
-	"gupdate": true, "gupdatem": true, "edgeupdate": true, "edgeupdatem": true,
-	"mapsbroker": true, "sppsvc": true, "remoteregistry": true, "cdpsvc": true,
-	"tiledatamodelsvc": true, "wbiosrvc": true, "clr_optimization_v4.0.30319_32": true,
-	"clr_optimization_v4.0.30319_64": true, "onesyncsvc": true, "shellhwdetection": true,
 }
 
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +78,7 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 				&SuggestedAction{Action: "process.list", Params: map[string]string{}, Label: "Show top processes"})
 		}
 		for _, svc := range hb.Services {
-			if strings.HasPrefix(strings.ToLower(svc.StartType), "auto") && strings.EqualFold(svc.Status, "stopped") && !benignStoppedServices[strings.ToLower(svc.Name)] {
+			if strings.HasPrefix(strings.ToLower(svc.StartType), "auto") && strings.EqualFold(svc.Status, "stopped") && !knowledge.BenignStoppedServices[strings.ToLower(svc.Name)] {
 				add("warning", "service", fmt.Sprintf("Automatic service %s (%s) is stopped", svc.Name, svc.DisplayName),
 					&SuggestedAction{Action: "service.start", Params: map[string]string{"name": svc.Name}, Label: "Start " + svc.Name})
 			}

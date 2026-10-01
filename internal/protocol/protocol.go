@@ -31,6 +31,26 @@ type Heartbeat struct {
 	Services     []Service  `json:"services"`
 	Events       []Event    `json:"events"`
 	Capabilities []string   `json:"capabilities"`
+	// Connections are listening ports and established TCP connections,
+	// deduplicated by the agent. The control plane learns server-to-server
+	// dependencies from them.
+	Connections []Connection `json:"connections,omitempty"`
+}
+
+// Connection states.
+const (
+	ConnListen      = "listen"
+	ConnEstablished = "established"
+)
+
+// Connection is a listening port (State listen, Local* set) or an outgoing
+// or incoming established TCP connection.
+type Connection struct {
+	State      string `json:"state"`
+	LocalPort  int    `json:"local_port"`
+	RemoteAddr string `json:"remote_addr,omitempty"`
+	RemotePort int    `json:"remote_port,omitempty"`
+	Process    string `json:"process,omitempty"`
 }
 
 // HeartbeatResponse tells the agent how often to report.

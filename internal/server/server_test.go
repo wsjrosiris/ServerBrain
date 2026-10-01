@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/wsjrosiris/serverbrain/internal/agent"
+	"github.com/wsjrosiris/serverbrain/internal/knowledge"
 	"github.com/wsjrosiris/serverbrain/internal/policy"
 	"github.com/wsjrosiris/serverbrain/internal/server"
 	"github.com/wsjrosiris/serverbrain/internal/store"
@@ -88,6 +91,9 @@ func TestEndToEnd(t *testing.T) {
 	}
 	defer st.Close()
 	srv := server.New(server.Config{HeartbeatInterval: 5 * time.Second, LongPollTimeout: 2 * time.Second}, st, policy.Default(), log)
+	vaultDir := t.TempDir()
+	vault := knowledge.NewVault(vaultDir, "ServerBrain", time.UTC, st, log)
+	srv.SetVault(vault)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	e := &env{t: t, ts: ts, store: st}
@@ -207,5 +213,52 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if tools := e.list(ai, "/api/ai/tools"); len(tools) < 10 {
 		t.Errorf("expected tool definitions, got %d", len(tools))
+	}
+
+	// 8. The server diary recorded enrollment, inventory, the action and the
+	// rejection; people can add their own entries.
+	if code, _ := e.call(viewer, http.MethodPost, "/api/servers/"+serverID+"/journal", map[string]any{"title": "x"}); code != http.StatusForbidden {
+		t.Errorf("viewer wrote to diary: %d", code)
+	}
+	if code, _ := e.call(admin, http.MethodPost, "/api/servers/"+serverID+"/journal", map[string]any{"title": "Wartungsfenster vereinbart", "detail": "So 02:00"}); code != http.StatusCreated {
+		t.Errorf("add diary entry: %d", code)
+	}
+	titles := map[string]string{}
+	for _, j := range e.list(viewer, "/api/journal?server="+serverID) {
+		titles[j["title"].(string)] = j["author"].(string)
+	}
+	for _, want := range []string{"Server in ServerBrain aufgenommen", "Inventar erfasst", "Aktion ausgeführt: network.test_port (host=127.0.0.1, port=" + port + ")", "Aktion abgelehnt: system.reboot (delay_seconds=600)", "Wartungsfenster vereinbart"} {
+		if _, ok := titles[want]; !ok {
+			t.Errorf("diary misses %q (have %v)", want, titles)
+		}
+	}
+	if titles["Wartungsfenster vereinbart"] != "admin" || titles["Aktion abgelehnt: system.reboot (delay_seconds=600)"] != "admin" {
+		t.Errorf("diary authors: %v", titles)
+	}
+
+	// 9. Knowledge API, AI context and the Obsidian vault.
+	if code, k := e.call(viewer, http.MethodGet, "/api/servers/"+serverID+"/knowledge", nil); code != http.StatusOK || k["vault_enabled"] != true {
+		t.Errorf("knowledge: %d %v", code, k)
+	}
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/knowledge/context?server="+serverID, nil)
+	req.Header.Set("Authorization", "Bearer "+ai)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctxDoc, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(ctxDoc), "## Servertagebuch") || !strings.Contains(string(ctxDoc), "Wartungsfenster vereinbart") {
+		t.Errorf("AI context:\n%s", ctxDoc)
+	}
+	if err := vault.Render(ctx); err != nil {
+		t.Fatal(err)
+	}
+	host, _ := os.Hostname()
+	if _, err := os.Stat(filepath.Join(vaultDir, "ServerBrain", "Server", knowledge.NoteName(host)+".md")); err != nil {
+		t.Errorf("server note missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(vaultDir, "ServerBrain", "Infrastruktur.md")); err != nil {
+		t.Errorf("infrastructure note missing: %v", err)
 	}
 }

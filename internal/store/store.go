@@ -112,7 +112,7 @@ func Open(path string) (*Store, error) {
 	}
 	// SQLite allows one writer; serializing keeps things simple and safe.
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + schemaKnowledge); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -370,7 +370,8 @@ func (s *Store) DeleteServer(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, q := range []string{`DELETE FROM metrics WHERE server_id=?`, `DELETE FROM events WHERE server_id=?`,
+	for _, q := range []string{`DELETE FROM metrics WHERE server_id=?`, `DELETE FROM events WHERE server_id=?`, `DELETE FROM facts WHERE server_id=?`,
+		`DELETE FROM dependencies WHERE src_id=?1 OR dst_id=?1`,
 		`UPDATE commands SET status='cancelled' WHERE server_id=? AND status IN ('pending_approval','queued')`, `DELETE FROM servers WHERE id=?`} {
 		if _, err := tx.ExecContext(ctx, q, id); err != nil {
 			return err

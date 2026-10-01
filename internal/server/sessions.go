@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,12 @@ type Session struct {
 	size    int
 	lastSeq int
 	notify  chan struct{}
+
+	// diary bookkeeping
+	opened     bool
+	journaled  bool
+	inputs     []string
+	inputCount int
 }
 
 func (s *Session) next() int { return s.base + len(s.chunks) }
@@ -254,6 +261,16 @@ func (s *Server) handleSessionInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess.Busy, sess.LastActive = true, time.Now().UTC()
+	sess.inputCount++
+	if len(sess.inputs) < 100 {
+		in := strings.TrimSpace(body.Code)
+		if len(in) > 300 {
+			in = in[:300] + "…"
+		}
+		if in != "" {
+			sess.inputs = append(sess.inputs, in)
+		}
+	}
 	h.append(sess, Chunk{Kind: "input", Text: body.Code, Cwd: sess.Cwd, By: u.Name})
 	h.enqueue(sess.ServerID, protocol.SessionOp{SessionID: sess.ID, Type: protocol.SessionInput, Code: body.Code})
 	h.mu.Unlock()
@@ -315,6 +332,7 @@ func (s *Server) closeSession(ctx context.Context, sess *Session, actor, actorTy
 	}
 	h.mu.Unlock()
 	_ = s.store.Audit(ctx, actor, actorType, "session.closed", sess.ServerID, map[string]any{"session": sess.ID, "message": msg})
+	s.journalSession(ctx, sess)
 	if notifyAgent {
 		s.wake(sess.ServerID)
 	}
@@ -424,7 +442,7 @@ func (s *Server) handleAgentSessionOutput(w http.ResponseWriter, r *http.Request
 			h.append(sess, Chunk{Kind: "output", Text: o.Text})
 		case protocol.OutputReady:
 			if sess.Status == sessionOpening {
-				sess.Status = sessionOpen
+				sess.Status, sess.opened = sessionOpen, true
 				audit = append(audit, map[string]any{"event": "session.opened"})
 			}
 			sess.Busy, sess.Cwd = false, o.Cwd
@@ -444,7 +462,11 @@ func (s *Server) handleAgentSessionOutput(w http.ResponseWriter, r *http.Request
 		}
 	}
 	sid := sess.ID
+	ended := sess.Status == sessionClosed || sess.Status == sessionFailed
 	h.mu.Unlock()
+	if ended {
+		s.journalSession(r.Context(), sess)
+	}
 	for _, a := range audit {
 		ev := a["event"].(string)
 		delete(a, "event")

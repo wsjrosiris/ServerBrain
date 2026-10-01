@@ -148,3 +148,18 @@ pre {
 }
 .term-row.busy .term-prompt { opacity: .4; }
 .term-row textarea:disabled { opacity: .5; }
+
+/* server diary & knowledge */
+.journal-day h3 { font-size: 13px; color: var(--muted); margin: 18px 0 6px; text-transform: capitalize; }
+.journal-day:first-child h3 { margin-top: 0; }
+.journal-entry { border-left: 3px solid var(--border); padding: 4px 0 4px 10px; margin: 4px 0; }
+.journal-entry.sev-crit { border-left-color: var(--crit); }
+.journal-entry.sev-warn { border-left-color: var(--warn); }
+.journal-entry.sev-ok { border-left-color: var(--ok); }
+.journal-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.journal-time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
+.journal-host { font-weight: 600; }
+.journal-detail { max-height: 220px; margin: 6px 0 2px; background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 8px 10px; }
+ul.plain { list-style: none; padding: 0; margin: 4px 0 12px; }
+ul.plain li { padding: 3px 0; }
+pre.notes { background: var(--bg); color: var(--text); border: 1px solid var(--border); font-family: inherit; font-size: 13px; }

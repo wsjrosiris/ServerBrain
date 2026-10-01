@@ -33,6 +33,30 @@ $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System','Application'; L
   if ($msg.Length -gt 2000) { $msg = $msg.Substring(0, 2000) }
   [pscustomobject]@{ time = $_.TimeCreated.ToUniversalTime().ToString('o'); log = $_.LogName; level = [string]$_.LevelDisplayName; level_num = [int]$_.Level; source = $_.ProviderName; event_id = $_.Id; message = $msg }
 })
+$procs = @{}
+Get-Process | ForEach-Object { $procs[[int]$_.Id] = $_.ProcessName }
+$all = @(Get-NetTCPConnection -State Listen,Established)
+$listen = @{}
+foreach ($t in $all) { if ([string]$t.State -eq 'Listen') { $listen[[int]$t.LocalPort] = $true } }
+$seen = @{}
+$conns = @(foreach ($t in $all) {
+  $p = [string]$procs[[int]$t.OwningProcess]
+  if ([string]$t.State -eq 'Listen') {
+    $k = "L|$($t.LocalPort)"
+    $c = [pscustomobject]@{ state = 'listen'; local_port = [int]$t.LocalPort; process = $p }
+  } else {
+    if ($t.RemoteAddress -in @('127.0.0.1', '::1')) { continue }
+    if ($listen.ContainsKey([int]$t.LocalPort)) {
+      # inbound client of a local service: remote port is irrelevant
+      $k = "I|$($t.RemoteAddress)|$($t.LocalPort)"
+      $c = [pscustomobject]@{ state = 'established'; local_port = [int]$t.LocalPort; remote_addr = [string]$t.RemoteAddress; remote_port = 0; process = $p }
+    } else {
+      $k = "E|$($t.RemoteAddress)|$($t.RemotePort)|$p"
+      $c = [pscustomobject]@{ state = 'established'; local_port = 0; remote_addr = [string]$t.RemoteAddress; remote_port = [int]$t.RemotePort; process = $p }
+    }
+  }
+  if (-not $seen.ContainsKey($k) -and $seen.Count -lt 1000) { $seen[$k] = $true; $c }
+})
 $ips = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object { $_.IPAddress } | Where-Object { $_ })
 [pscustomobject]@{
   hostname   = $env:COMPUTERNAME
@@ -47,22 +71,24 @@ $ips = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=Tr
   disks      = $disks
   services   = $services
   events     = $events
+  connections = $conns
 } | ConvertTo-Json -Depth 4 -Compress
 `
 
 type winSnapshot struct {
-	Hostname  string                 `json:"hostname"`
-	OSVersion string                 `json:"os_version"`
-	Domain    string                 `json:"domain"`
-	CPUs      int                    `json:"cpus"`
-	BootTime  string                 `json:"boot_time"`
-	IPs       list[string]           `json:"ips"`
-	CPU       float64                `json:"cpu"`
-	MemTotal  uint64                 `json:"mem_total"`
-	MemFree   uint64                 `json:"mem_free"`
-	Disks     list[protocol.Disk]    `json:"disks"`
-	Services  list[protocol.Service] `json:"services"`
-	Events    list[winEvent]         `json:"events"`
+	Hostname  string                    `json:"hostname"`
+	OSVersion string                    `json:"os_version"`
+	Domain    string                    `json:"domain"`
+	CPUs      int                       `json:"cpus"`
+	BootTime  string                    `json:"boot_time"`
+	IPs       list[string]              `json:"ips"`
+	CPU       float64                   `json:"cpu"`
+	MemTotal  uint64                    `json:"mem_total"`
+	MemFree   uint64                    `json:"mem_free"`
+	Disks     list[protocol.Disk]       `json:"disks"`
+	Services  list[protocol.Service]    `json:"services"`
+	Events    list[winEvent]            `json:"events"`
+	Conns     list[protocol.Connection] `json:"connections"`
 }
 
 type winEvent struct {
@@ -152,7 +178,8 @@ func (c *collector) collect(ctx context.Context, since time.Time) *protocol.Hear
 			Disks:       snap.Disks,
 			CollectedAt: time.Now().UTC(),
 		},
-		Services: snap.Services,
+		Services:    snap.Services,
+		Connections: snap.Conns,
 	}
 	for _, e := range snap.Events {
 		t, _ := time.Parse(time.RFC3339Nano, e.Time)

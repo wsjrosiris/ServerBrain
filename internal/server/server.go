@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/wsjrosiris/serverbrain/internal/actions"
+	"github.com/wsjrosiris/serverbrain/internal/knowledge"
 	"github.com/wsjrosiris/serverbrain/internal/policy"
 	"github.com/wsjrosiris/serverbrain/internal/protocol"
 	"github.com/wsjrosiris/serverbrain/internal/server/web"
@@ -71,11 +72,21 @@ type Server struct {
 	waiters map[string]chan struct{} // serverID -> wake-up signal for long polls
 
 	sessions *sessionHub
+	learner  *knowledge.Learner
+	vault    *knowledge.Vault // nil when no Obsidian vault is configured
 }
 
 func New(cfg Config, st *store.Store, pol *policy.Policy, log *slog.Logger) *Server {
 	cfg.defaults()
-	return &Server{cfg: cfg, store: st, policy: pol, log: log, waiters: map[string]chan struct{}{}, sessions: newSessionHub()}
+	return &Server{cfg: cfg, store: st, policy: pol, log: log, waiters: map[string]chan struct{}{}, sessions: newSessionHub(),
+		learner: knowledge.NewLearner(st, log)}
+}
+
+// SetVault enables rendering knowledge into an Obsidian vault.
+func (s *Server) SetVault(v *knowledge.Vault) {
+	s.vault = v
+	v.OfflineAfter = 3 * s.cfg.HeartbeatInterval
+	s.learner.OnChange = v.Notify
 }
 
 // Handler returns the HTTP handler for the whole control plane.
@@ -109,6 +120,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sid}/approve", s.userAuth(policy.RoleAdmin, s.handleSessionDecide(true)))
 	mux.HandleFunc("POST /api/sessions/{sid}/reject", s.userAuth(policy.RoleAdmin, s.handleSessionDecide(false)))
 	mux.HandleFunc("GET /api/events", s.userAuth(policy.RoleViewer, s.handleEvents))
+	mux.HandleFunc("GET /api/journal", s.userAuth(policy.RoleViewer, s.handleJournal))
+	mux.HandleFunc("POST /api/journal", s.userAuth(policy.RoleOperator, s.handleAddJournal))
+	mux.HandleFunc("POST /api/servers/{id}/journal", s.userAuth(policy.RoleOperator, s.handleAddJournal))
+	mux.HandleFunc("GET /api/servers/{id}/knowledge", s.userAuth(policy.RoleViewer, s.handleServerKnowledge))
+	mux.HandleFunc("GET /api/dependencies", s.userAuth(policy.RoleViewer, s.handleDependencies))
+	mux.HandleFunc("GET /api/knowledge/context", s.userAuth(policy.RoleViewer, s.handleKnowledgeContext))
 	mux.HandleFunc("GET /api/alerts", s.userAuth(policy.RoleViewer, s.handleAlerts))
 	mux.HandleFunc("GET /api/actions", s.userAuth(policy.RoleViewer, s.handleCatalog))
 	mux.HandleFunc("GET /api/ai/tools", s.userAuth(policy.RoleViewer, s.handleAITools))
@@ -142,6 +159,9 @@ func (s *Server) Run(ctx context.Context) {
 		case <-t.C:
 		}
 		s.maintainSessions(ctx)
+		if list, err := s.store.ListServers(ctx, false); err == nil {
+			s.learner.CheckAvailability(ctx, list, 3*s.cfg.HeartbeatInterval)
+		}
 		if n, err := s.store.ExpireStale(ctx, s.cfg.PendingTTL, s.cfg.DispatchTTL); err != nil {
 			s.log.Error("expire commands", "err", err)
 		} else if n > 0 {
@@ -317,6 +337,8 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	_ = s.store.Audit(r.Context(), req.System.Hostname, "agent", "agent.enrolled", id,
 		map[string]any{"remote_addr": s.remoteAddr(r), "os": req.System.OS, "os_version": req.System.OSVersion})
 	s.log.Info("agent enrolled", "server", id, "hostname", req.System.Hostname)
+	_ = s.learner.Note(r.Context(), id, store.CatInventory, store.SevInfo, "Server in ServerBrain aufgenommen",
+		fmt.Sprintf("Agent %s · %s · verbunden von %s", req.AgentVersion, firstNonEmpty(req.System.OSVersion, req.System.OS), s.remoteAddr(r)), "ServerBrain")
 	writeJSON(w, http.StatusOK, protocol.EnrollResponse{AgentID: id, AgentSecret: secret})
 }
 
@@ -330,9 +352,19 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if hb.System.Hostname == "" {
 		hb.System.Hostname = srv.Hostname
 	}
+	prev, err := s.store.GetServer(r.Context(), srv.ID)
+	if err != nil {
+		s.internalErr(w, err)
+		return
+	}
+	events := hb.Events
 	if err := s.store.RecordHeartbeat(r.Context(), srv.ID, s.remoteAddr(r), &hb); err != nil {
 		s.internalErr(w, err)
 		return
+	}
+	hb.Events = events
+	if fleet, err := s.store.ListServers(r.Context(), false); err == nil {
+		s.learner.Observe(context.WithoutCancel(r.Context()), prev, &hb, fleet)
 	}
 	writeJSON(w, http.StatusOK, protocol.HeartbeatResponse{IntervalSeconds: int(s.cfg.HeartbeatInterval / time.Second)})
 }
@@ -383,6 +415,7 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		s.internalErr(w, err)
 		return
 	}
+	s.journalCommand(r.Context(), cmd)
 	_ = s.store.Audit(r.Context(), srv.Hostname, "agent", "command."+cmd.Status, cmd.ID,
 		map[string]any{"action": cmd.Action, "exit_code": res.ExitCode, "error": res.Error})
 	writeJSON(w, http.StatusOK, map[string]string{"status": cmd.Status})
@@ -671,6 +704,10 @@ func (s *Server) handleDecide(approve bool) http.HandlerFunc {
 			return
 		}
 		_ = s.store.Audit(r.Context(), u.Name, u.Kind, event, c.ServerID, map[string]any{"command": c.ID, "action": c.Action, "requested_by": c.RequestedBy})
+		if !approve {
+			_ = s.learner.Note(r.Context(), c.ServerID, store.CatAction, store.SevInfo, "Aktion abgelehnt: "+c.Action+paramSummary(c.Params),
+				"Angefordert von "+c.RequestedBy+actorSuffix(c.ActorType)+reasonSuffix(c.Reason), u.Name)
+		}
 		if approve {
 			s.wake(c.ServerID)
 		}
@@ -782,4 +819,13 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
 	_ = s.store.Audit(r.Context(), u.Name, u.Kind, "user.created", nu.ID, map[string]any{"name": nu.Name, "role": nu.Role, "kind": nu.Kind})
 	writeJSON(w, http.StatusCreated, map[string]any{"user": nu, "token": tok})
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

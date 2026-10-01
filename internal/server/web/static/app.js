@@ -172,7 +172,7 @@ function route() {
   const name = parts[0] || "overview";
   for (const a of document.querySelectorAll("nav a")) a.classList.toggle("active", a.dataset.route === (name === "servers" ? "overview" : name));
   clearInterval(state.timer);
-  const views = { overview: viewOverview, servers: () => viewServer(parts[1]), approvals: viewApprovals, commands: viewCommands, events: viewEvents, audit: viewAudit, settings: viewSettings };
+  const views = { overview: viewOverview, servers: () => viewServer(parts[1]), approvals: viewApprovals, journal: viewJournal, commands: viewCommands, events: viewEvents, audit: viewAudit, settings: viewSettings };
   (views[name] || viewOverview)();
 }
 window.addEventListener("hashchange", route);
@@ -232,7 +232,7 @@ async function viewServer(id) {
   let tab = "overview";
   let server = null;
 
-  const tabs = [["overview", "Übersicht"], ["services", "Dienste"], ["events", "Ereignisse"], ["actions", "Aktionen"], ["console", "Konsole"]];
+  const tabs = [["overview", "Übersicht"], ["knowledge", "Wissen"], ["journal", "Tagebuch"], ["services", "Dienste"], ["events", "Ereignisse"], ["actions", "Aktionen"], ["console", "Konsole"]];
   const tabBar = h("div", { class: "tabs" });
   function renderTabs() {
     tabBar.replaceChildren(...tabs.map(([k, label]) => h("button", { class: tab === k ? "active" : "", onclick: () => { tab = k; renderTabs(); renderTab(); } }, label)));
@@ -259,6 +259,8 @@ async function viewServer(id) {
       if (tab === "events") body.replaceChildren(await serverEvents(server));
       if (tab === "actions") body.replaceChildren(await serverActions(server));
       if (tab === "console") body.replaceChildren(await serverConsole(server));
+      if (tab === "knowledge") body.replaceChildren(await serverKnowledge(server));
+      if (tab === "journal") body.replaceChildren(await serverJournal(server));
     } catch (e) { body.replaceChildren(errorBox(e)); }
   }
 
@@ -598,6 +600,125 @@ function commandsTable(cmds, withHost) {
       h("td", {}, sev(c.risk, c.risk === "critical" ? "critical-risk" : c.risk)),
       h("td", {}, sev(c.status)),
       h("td", { class: "small" }, c.requested_by + (c.actor_type === "ai" ? " (KI)" : ""))))));
+}
+
+// ---------- knowledge & diary ----------
+
+const sevIcons = { crit: "🔴", warn: "🟠", ok: "🟢", info: "🔹" };
+const catLabels = { inventar: "Inventar", verfuegbarkeit: "Verfügbarkeit", dienst: "Dienst", software: "Software", rolle: "Rolle", ressource: "Ressource",
+  ereignis: "Ereignis", system: "System", netzwerk: "Netzwerk", aktion: "Aktion", konsole: "Konsole", notiz: "Notiz" };
+
+async function apiText(path) {
+  const res = await fetch(path, { headers: { "Authorization": "Bearer " + state.token } });
+  if (!res.ok) throw new Error(res.statusText);
+  return res.text();
+}
+
+// journalList renders diary entries grouped by day (newest first).
+function journalList(entries, withHost) {
+  if (!entries.length) return h("div", { class: "empty" }, "Noch keine Einträge im Zeitraum.");
+  const byDay = new Map();
+  for (const e of entries) {
+    const d = new Date(e.ts).toLocaleDateString("de-DE", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" });
+    if (!byDay.has(d)) byDay.set(d, []);
+    byDay.get(d).push(e);
+  }
+  return h("div", {}, [...byDay.entries()].map(([day, list]) => h("div", { class: "journal-day" },
+    h("h3", {}, day),
+    list.map((e) => h("div", { class: "journal-entry sev-" + e.severity },
+      h("div", { class: "journal-head" },
+        h("span", { class: "journal-time" }, new Date(e.ts).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })),
+        h("span", { "aria-hidden": "true" }, sevIcons[e.severity] || ""),
+        withHost && e.server_id ? h("a", { href: "#/servers/" + e.server_id, class: "journal-host" }, e.hostname || e.server_id) : null,
+        withHost && !e.server_id ? h("span", { class: "journal-host muted" }, "Allgemein") : null,
+        h("strong", {}, e.title),
+        h("span", { class: "tag" }, catLabels[e.category] || e.category),
+        e.author && e.author !== "ServerBrain" ? h("span", { class: "muted small" }, "· " + e.author) : null),
+      e.detail ? h("pre", { class: "journal-detail" }, e.detail) : null)))));
+}
+
+function journalForm(serverId, onDone) {
+  const title = h("input", { placeholder: serverId ? "Neuer Eintrag, z. B. „Zertifikat erneuert“" : "Neuer Eintrag (allgemein)" });
+  const detail = h("textarea", { placeholder: "Details (optional, Markdown)", rows: "2" });
+  const err = h("div");
+  const save = async () => {
+    if (!title.value.trim()) return;
+    try {
+      await api("POST", serverId ? `/api/servers/${serverId}/journal` : "/api/journal", { title: title.value.trim(), detail: detail.value });
+      title.value = ""; detail.value = ""; err.replaceChildren();
+      onDone();
+    } catch (e) { err.replaceChildren(errorBox(e)); }
+  };
+  title.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+  return h("div", { class: "panel" }, h("h2", {}, "Eintrag hinzufügen"), title, detail, err,
+    h("div", { class: "row decision" }, h("button", { class: "primary", onclick: save }, "Eintragen"),
+      h("span", { class: "muted small" }, "Wird auch in die Tagesnotiz im Obsidian-Vault geschrieben.")));
+}
+
+async function serverJournal(s) {
+  const box = h("div", { class: "panel" });
+  const days = h("select", {}, [7, 30, 90, 365].map((d) => h("option", { value: d }, "letzte " + d + " Tage")));
+  const load = async () => {
+    try { box.replaceChildren(journalList(await api("GET", `/api/journal?server=${s.id}&days=${days.value}&limit=1000`), false)); }
+    catch (e) { box.replaceChildren(errorBox(e)); }
+  };
+  days.addEventListener("change", load);
+  await load();
+  return h("div", {}, canOperate() ? journalForm(s.id, load) : null, h("div", { class: "row" }, days), box);
+}
+
+async function viewJournal() {
+  const box = h("div", { class: "panel" });
+  const days = h("select", {}, [1, 7, 30, 90].map((d) => h("option", { value: d, selected: d === 7 }, d === 1 ? "heute & gestern" : "letzte " + d + " Tage")));
+  const sevFilter = h("select", {}, h("option", { value: "" }, "alle Einträge"), h("option", { value: "warn" }, "nur Warnungen & Kritisches"));
+  const load = async () => {
+    try {
+      let list = await api("GET", `/api/journal?days=${days.value === "1" ? 2 : days.value}&limit=2000`);
+      if (sevFilter.value) list = list.filter((e) => e.severity === "warn" || e.severity === "crit");
+      box.replaceChildren(journalList(list, true));
+    } catch (e) { box.replaceChildren(errorBox(e)); }
+  };
+  days.addEventListener("change", load);
+  sevFilter.addEventListener("change", load);
+  setView(h("h1", {}, "Servertagebuch"),
+    h("p", { class: "muted" }, "ServerBrain führt automatisch Tagebuch über alle Server: Neustarts, gestoppte Dienste, neue Software, neue Fehlerbilder, Ausfälle, entdeckte Abhängigkeiten, ausgeführte Aktionen und Konsolensitzungen. Jeder Tag wird als Notiz in den Obsidian-Vault geschrieben."),
+    canOperate() ? journalForm(null, load) : null, h("div", { class: "row" }, days, sevFilter), box);
+  await load();
+  every(30000, load);
+}
+
+async function serverKnowledge(s) {
+  const k = await api("GET", `/api/servers/${s.id}/knowledge`);
+  const outgoing = k.dependencies.filter((d) => d.src_id === s.id);
+  const incoming = k.dependencies.filter((d) => d.dst_id === s.id);
+  const depRow = (otherId, otherHost, d) => h("li", {}, h("a", { href: "#/servers/" + otherId }, otherHost || otherId),
+    " — Port ", h("strong", {}, String(d.port)), d.process ? " · " + d.process : "", h("span", { class: "muted small" }, " · seit " + fmtTime(d.first_seen)));
+  const showContext = async () => {
+    try { openModal(h("h2", {}, "KI-Kontext für " + s.hostname), h("p", { class: "muted small" }, "Das liest ein KI-Assistent, bevor er diesen Server analysiert (GET /api/knowledge/context)."), h("pre", {}, await apiText(`/api/knowledge/context?server=${s.id}`)), h("button", { onclick: closeModal }, "Schließen")); }
+    catch (e) { alert(e.message); }
+  };
+  return h("div", {},
+    h("div", { class: "cols" },
+      h("div", { class: "panel" }, h("h2", {}, "Erkannte Rollen"),
+        k.roles.length ? h("ul", { class: "plain" }, k.roles.map((r) => h("li", {}, h("strong", {}, r.name), h("span", { class: "muted small" }, " — " + r.via + ", seit " + fmtTime(r.since)))))
+          : h("div", { class: "empty" }, "Noch keine Rolle erkannt."),
+        k.baseline.samples ? h("div", {}, h("h2", {}, "Normale Auslastung (7 Tage)"),
+          h("p", {}, `CPU ⌀ ${k.baseline.cpu_avg.toFixed(0)} % (max ${k.baseline.cpu_max.toFixed(0)} %) · RAM ⌀ ${k.baseline.mem_avg_pct.toFixed(0)} % · Datenträger max ${k.baseline.disk_max_pct.toFixed(0)} %`)) : null),
+      h("div", { class: "panel" }, h("h2", {}, "Abhängigkeiten"),
+        outgoing.length || incoming.length ? h("div", {},
+          outgoing.length ? h("div", {}, h("div", { class: "muted small" }, "Nutzt"), h("ul", { class: "plain" }, outgoing.map((d) => depRow(d.dst_id, d.dst_host, d)))) : null,
+          incoming.length ? h("div", {}, h("div", { class: "muted small" }, "Wird genutzt von"), h("ul", { class: "plain" }, incoming.map((d) => depRow(d.src_id, d.src_host, d)))) : null)
+          : h("div", { class: "empty" }, "Noch keine Verbindungen zu anderen verwalteten Servern beobachtet."))),
+    h("div", { class: "panel" }, h("h2", {}, "Bekannte Fehlerbilder (30 Tage)"),
+      k.error_patterns.length ? h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Quelle"), h("th", {}, "ID"), h("th", {}, "Anzahl"), h("th", {}, "Zuletzt"), h("th", {}, "Meldung"))),
+        h("tbody", {}, k.error_patterns.map((e) => h("tr", {}, h("td", {}, e.source), h("td", {}, e.event_id), h("td", {}, e.count), h("td", { class: "small" }, fmtTime(e.last)),
+          h("td", { class: "small" }, e.message.length > 200 ? e.message.slice(0, 200) + "…" : e.message)))))
+        : h("div", { class: "empty" }, "Keine Fehler-Ereignisse in den letzten 30 Tagen.")),
+    h("div", { class: "panel" }, h("h2", {}, "Notizen aus Obsidian"),
+      !k.vault_enabled ? h("p", { class: "muted" }, "Kein Obsidian-Vault konfiguriert (sb-server -vault <pfad>).")
+        : k.manual_notes ? h("pre", { class: "notes" }, k.manual_notes)
+        : h("p", { class: "muted" }, "Noch keine eigenen Notizen. Öffne ", h("code", {}, k.note_path || "die Server-Notiz"), " in Obsidian und schreibe unter „Notizen“ – Ansprechpartner, Besonderheiten, Workarounds. ServerBrain liest sie und gibt sie der KI als Kontext mit."),
+      h("div", { class: "row decision" }, h("button", { onclick: showContext }, "KI-Kontext anzeigen"))));
 }
 
 // ---------- approvals / commands / events / audit ----------

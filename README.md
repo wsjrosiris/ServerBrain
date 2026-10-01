@@ -82,6 +82,7 @@ Für die Entwicklung läuft der Agent auch unter Linux und meldet dann Metriken 
 | Dienste | Komplette Dienstliste mit Status und Starttyp, Start/Stopp/Neustart per Klick |
 | Event Logs | System/Application, Warnung und höher, inkrementell übertragen, 30 Tage Aufbewahrung |
 | Alerts | Server offline, Disk ≥ 90/95 %, RAM/CPU ≥ 95 %, gestoppte Autostart-Dienste, Fehlerhäufung, jeweils mit **vorgeschlagener Aktion** |
+| Second Brain | Automatisches Lernen von Rollen, Abhängigkeiten, Baselines und Fehlerbildern, **Servertagebuch**, **Obsidian-Vault** (siehe unten) |
 | Remote PowerShell | Interaktive, dauerhafte PowerShell-Sitzung auf dem Server, **immer über den Agenten** (siehe unten). Lokal opt-in, standardmäßig nur für Admins, jede Eingabe auditiert |
 | Aktionen | siehe Katalog unten, mit Vorschau der Befehle und Policy-Entscheidung vor der Ausführung |
 | Freigaben | Warteschlange für Aktionen mit Effekt `approve`, Freigeben/Ablehnen/Zurückziehen, optional Vier-Augen-Prinzip |
@@ -129,6 +130,66 @@ Browser ──HTTPS──▶ Zentrale ──(Policy, Audit)──▶ Warteschlan
 
 Für einzelne, freigabepflichtige Skripte (z. B. von der KI vorgeschlagen) gibt es weiterhin die Aktion `shell.run`.
 
+## Second Brain: Wissen, Servertagebuch & Obsidian
+
+ServerBrain **lernt automatisch** aus jedem Heartbeat und schreibt sein Wissen in einen **Obsidian-Vault**. Das sind normale Markdown-Dateien mit Links, Properties und Tags. Du öffnest den Ordner in Obsidian und hast eine lebende Dokumentation deiner Infrastruktur, inklusive Graph-Ansicht.
+
+### Was ServerBrain lernt
+
+| Wissen | Woher |
+|---|---|
+| **Rollen** (IIS, SQL Server, Domain Controller, DNS, DHCP, Hyper-V, Exchange, RDS, WSUS, Docker, Veeam …) | installierte Dienste, unter Linux lauschende Ports |
+| **Abhängigkeiten** zwischen Servern („WEB-03 → SQL-01 Port 1433, Prozess w3wp“) | TCP-Verbindungen, die die Agenten melden (`Get-NetTCPConnection`), aufgelöst auf bekannte Server-IPs |
+| **Normale Auslastung** (CPU/RAM/Disk, 7 Tage) | Metrikverlauf |
+| **Bekannte Fehlerbilder** (Quelle + Event-ID, Häufigkeit) | Event Logs |
+| **Inventar** (OS, Domäne, Hardware, IPs, Datenträger, lauschende Ports, wichtige Dienste) | Heartbeat |
+
+### Servertagebuch
+
+ServerBrain vergleicht jeden Heartbeat mit dem bisherigen Wissen und schreibt **nur echte Veränderungen** ins Tagebuch:
+
+- Server aufgenommen, Inventar erfasst, nicht mehr erreichbar / wieder erreichbar
+- Neustart erkannt, OS-, Hostname-, IP-, Domänen- und Hardware-Änderungen, Agent-Update
+- Autostart- oder rollenkritischer Dienst gestoppt / läuft wieder, Starttyp geändert, Dienste installiert / entfernt
+- Neue / nicht mehr erkannte Rolle, neuer Datenträger, Datenträger über 90 / 95 % bzw. wieder darunter
+- **Neues Fehlerbild** (erstes Auftreten von Quelle + Event-ID). Wiederholungen werden nur gezählt. Kritische Ereignisse werden immer eingetragen.
+- Neue Abhängigkeit entdeckt
+- Ausgeführte, fehlgeschlagene und abgelehnte Aktionen (wer, warum, wer hat freigegeben, Ausgabe)
+- Konsolensitzungen (wer, warum, welche Befehle)
+- Eigene Einträge von Admins (Konsole → *Tagebuch*, oder `POST /api/servers/{id}/journal`)
+
+Manuell gestartete Dienste, die ständig an- und ausgehen, und Metrik-Rauschen landen bewusst nicht im Tagebuch.
+
+### Aufbau des Vaults
+
+```text
+<vault>/ServerBrain/
+├── Start.md                     Einstieg, letzte Tagebuchtage
+├── Infrastruktur.md             alle Server, Rollen-Index, Abhängigkeitsgraph (Mermaid)
+├── Server/
+│   ├── WEB-03.md                Steckbrief: Rollen, Datenträger, Abhängigkeiten (verlinkt),
+│   └── SQL-01.md                Ports, wichtige Dienste, Auslastung, Fehlerbilder, letzte Einträge
+└── Tagebuch/2026/
+    └── 2026-10-01.md            Servertagebuch des Tages, gruppiert nach Server
+```
+
+- **Properties** (`typ`, `status`, `rollen`, `ip`, `ram_gb`, …) und Tags (`#serverbrain/server`, `#rolle/web`, `#sb/dienst` …) machen den Vault mit Dataview, Bases oder der Suche auswertbar.
+- **Deine Notizen bleiben erhalten.** ServerBrain pflegt nur den Bereich zwischen den unsichtbaren `%% serverbrain:begin %%` / `%% serverbrain:end %%`-Markern und seine eigenen Properties. Alles darunter (z. B. „## Notizen“: Ansprechpartner, Wartungsfenster, Workarounds) und eigene Properties gehören dir.
+- **Rückkanal zur KI.** Was du in Obsidian unter einen Server schreibst, liest ServerBrain zurück. Du siehst es in der Konsole unter *Wissen*, und es fließt in den KI-Kontext ein.
+- Dateien werden nur geschrieben, wenn sich der Inhalt ändert. Sync-Tools sehen also keine unnötigen Änderungen.
+
+### Einrichtung
+
+```bash
+sb-server -vault /srv/obsidian/Infrastruktur -vault-folder ServerBrain -timezone Europe/Berlin
+```
+
+Standard ist `-vault ./vault`, `-vault ""` schaltet es ab. Der Vault-Ordner muss nur dort erreichbar sein, wo Obsidian läuft, zum Beispiel über eine SMB-Freigabe, Syncthing, OneDrive/SharePoint, Obsidian Sync oder ein Git-Repository (Obsidian-Git-Plugin). `-vault-folder` erlaubt, ServerBrain in einen bestehenden Vault einzuhängen. Alle Links nutzen volle Pfade, deshalb gibt es keine Namenskonflikte.
+
+### Wissen für die KI
+
+`GET /api/knowledge/context?server=<id>` liefert ein kompaktes Markdown-Briefing: Steckbrief, Rollen, Abhängigkeiten, normale Auslastung, bekannte Fehlerbilder, **deine Obsidian-Notizen** und das Servertagebuch der letzten Tage. Das ist das Gedächtnis, das ein KI-Assistent liest, bevor er „Warum ist WEB-03 down?“ beantwortet.
+
 ## Policy Engine & KI-Modi
 
 Regeln werden von oben nach unten ausgewertet. Die erste passende Regel gewinnt, ohne Treffer wird **blockiert**. Eine Regel matcht auf Aktion (Glob), Risiko, read-only, Hostname (Glob), Tags, Akteurstyp (`human`/`ai`) und Rolle. Ihr Effekt ist `allow`, `approve` oder `block`.
@@ -171,6 +232,11 @@ Alle Operator-Endpunkte erwarten `Authorization: Bearer <token>`.
 | `GET /api/sessions/{sid}/output?after=N` | Besitzer/admin | Long-Poll auf neue Ausgabe |
 | `POST /api/sessions/{sid}/input` · `/reset` · `DELETE /api/sessions/{sid}` | Besitzer | Befehl senden, Shell neu starten, beenden |
 | `POST /api/sessions/{sid}/approve` · `/reject` | admin | Sitzung freigeben |
+| `GET /api/journal?server=&days=7` | viewer | Servertagebuch |
+| `POST /api/journal`, `POST /api/servers/{id}/journal` | operator | Eigener Tagebucheintrag `{title, detail}` |
+| `GET /api/servers/{id}/knowledge` | viewer | Gelerntes Wissen und Obsidian-Notizen |
+| `GET /api/dependencies` | viewer | Gelernter Abhängigkeitsgraph |
+| `GET /api/knowledge/context?server=` | viewer | Markdown-Briefing für die KI |
 | `GET /api/audit` | admin | Audit Log |
 | `POST /api/enrollment-tokens`, `GET/POST /api/users` | admin | Verwaltung |
 
@@ -190,7 +256,8 @@ cmd/sb-agent          Agent (CLI + Windows-Service)
 internal/actions      Aktionskatalog: Validierung, Vorschau, Skripte
 internal/policy       Policy Engine
 internal/store        SQLite-Persistenz
-internal/server       HTTP-API, Alerts, eingebettete Web-Konsole (web/static)
+internal/server       HTTP-API, Alerts, Sessions, eingebettete Web-Konsole (web/static)
+internal/knowledge    Second Brain: Rollen, Lerner (Tagebuch, Abhängigkeiten), Obsidian-Vault
 internal/agent        Collector (PowerShell/CIM unter Windows), Executor, native Aktionen
 internal/protocol     Wire-Typen Agent ↔ Zentrale
 deploy/               Beispiel-Policy, systemd-Units
@@ -200,6 +267,6 @@ deploy/               Beispiel-Policy, systemd-Units
 
 **Phase 2: KI-Diagnose.** Diagnose-Assistent in der Konsole („Warum ist WEB-03 down?“) mit Tool Calling auf Basis von `/api/ai/tools`, „Explain & Fix“-Ansicht mit Diagnosepfad und empfohlenen Schritten, automatische Remediation über Policy-gesteuerte Autonomie, feinere RBAC (Server-Gruppen, Tag-Scopes), SSO/OIDC.
 
-**Phase 3: Infrastruktur-Kontext.** Abhängigkeitsgraph zwischen Servern (Web → App → SQL, DCs), serverübergreifende Root-Cause-Analyse, Flottenoperationen („auf allen Servern mit < 10 GB frei …“), Self-Healing-Playbooks, Compliance-Checks, Multi-Tenant, PostgreSQL als Backend.
+**Phase 3: Infrastruktur-Kontext.** Serverübergreifende Root-Cause-Analyse auf Basis des gelernten Abhängigkeitsgraphen und des Tagebuchs, Flottenoperationen („auf allen Servern mit < 10 GB frei …“), Self-Healing-Playbooks, Compliance-Checks, Multi-Tenant, PostgreSQL als Backend.
 
 **Technische Härtung.** Agent-Selbstupdate mit signierten Binaries, signierte Commands (Ende-zu-Ende vom Freigebenden bis zum Agenten), Rotation der Agent-Secrets, Export des Audit Logs (Syslog/SIEM), WebSocket-Live-Updates in der UI.

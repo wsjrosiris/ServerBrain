@@ -5,6 +5,8 @@ package agent
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
+	"fmt"
 	"net"
 	"os"
 	"runtime"
@@ -153,5 +155,85 @@ func (c *collector) collect(ctx context.Context, since time.Time) *protocol.Hear
 			Disks:       disks(),
 			CollectedAt: time.Now().UTC(),
 		},
+		Connections: tcpConnections(),
 	}
+}
+
+// tcpConnections reads /proc/net/tcp{,6}. Inbound connections to a local
+// listening port are reported once per client (remote port 0); outgoing
+// ones once per remote endpoint. Process names are not resolved here.
+func tcpConnections() []protocol.Connection {
+	type row struct {
+		local, remote net.IP
+		lport, rport  int
+		state         string
+	}
+	var rows []row
+	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n")[1:] {
+			f := strings.Fields(line)
+			if len(f) < 4 || (f[3] != "0A" && f[3] != "01") {
+				continue
+			}
+			lip, lport, ok1 := parseProcAddr(f[1])
+			rip, rport, ok2 := parseProcAddr(f[2])
+			if ok1 && ok2 {
+				rows = append(rows, row{lip, rip, lport, rport, f[3]})
+			}
+		}
+	}
+	listen := map[int]bool{}
+	for _, r := range rows {
+		if r.state == "0A" {
+			listen[r.lport] = true
+		}
+	}
+	seen := map[string]bool{}
+	var out []protocol.Connection
+	add := func(key string, c protocol.Connection) {
+		if !seen[key] && len(seen) < 1000 {
+			seen[key] = true
+			out = append(out, c)
+		}
+	}
+	for _, r := range rows {
+		switch {
+		case r.state == "0A":
+			add(fmt.Sprintf("L|%d", r.lport), protocol.Connection{State: protocol.ConnListen, LocalPort: r.lport})
+		case r.remote.IsLoopback():
+		case listen[r.lport]:
+			add(fmt.Sprintf("I|%s|%d", r.remote, r.lport), protocol.Connection{State: protocol.ConnEstablished, LocalPort: r.lport, RemoteAddr: r.remote.String()})
+		default:
+			add(fmt.Sprintf("E|%s|%d", r.remote, r.rport), protocol.Connection{State: protocol.ConnEstablished, RemoteAddr: r.remote.String(), RemotePort: r.rport})
+		}
+	}
+	return out
+}
+
+// parseProcAddr decodes "0100007F:1F90" (little-endian 32-bit words).
+func parseProcAddr(s string) (net.IP, int, bool) {
+	hexIP, hexPort, ok := strings.Cut(s, ":")
+	if !ok {
+		return nil, 0, false
+	}
+	port, err := strconv.ParseUint(hexPort, 16, 16)
+	if err != nil {
+		return nil, 0, false
+	}
+	raw, err := hex.DecodeString(hexIP)
+	if err != nil || (len(raw) != 4 && len(raw) != 16) {
+		return nil, 0, false
+	}
+	ip := make(net.IP, len(raw))
+	for i := 0; i < len(raw); i += 4 {
+		ip[i], ip[i+1], ip[i+2], ip[i+3] = raw[i+3], raw[i+2], raw[i+1], raw[i]
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip, int(port), true
 }

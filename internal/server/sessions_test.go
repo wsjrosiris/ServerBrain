@@ -184,6 +184,20 @@ func TestConsoleSessionRunsOnAgent(t *testing.T) {
 		t.Fatalf("input into closed session: %d", c)
 	}
 
+	// The session is summarized in the server diary.
+	foundDiary := false
+	for _, j := range e.list(admin, "/api/journal?server="+serverID) {
+		if strings.HasPrefix(j["title"].(string), "Konsolensitzung:") {
+			foundDiary = true
+			if d := j["detail"].(string); !strings.Contains(d, "SB_TEST_VAR=persisted") || !strings.Contains(d, "investigate IIS") {
+				t.Errorf("session diary detail: %s", d)
+			}
+		}
+	}
+	if !foundDiary {
+		t.Error("console session not in diary")
+	}
+
 	// Every typed command is in the audit log.
 	inputs := 0
 	events := map[string]bool{}

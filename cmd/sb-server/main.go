@@ -12,9 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
+	_ "time/tzdata" // the diary time zone must work on hosts without tzdata
 
+	"github.com/wsjrosiris/serverbrain/internal/knowledge"
 	"github.com/wsjrosiris/serverbrain/internal/policy"
 	"github.com/wsjrosiris/serverbrain/internal/server"
 	"github.com/wsjrosiris/serverbrain/internal/store"
@@ -31,6 +34,9 @@ func main() {
 		interval   = flag.Duration("heartbeat", 30*time.Second, "agent heartbeat interval")
 		trustProxy = flag.Bool("trust-proxy", false, "trust X-Forwarded-For for client addresses")
 		newAdmin   = flag.String("create-admin", "", "create an additional admin user with this name, print its token and exit (token recovery)")
+		vaultDir   = flag.String("vault", "vault", "Obsidian vault directory for the knowledge base and server diary (empty disables it)")
+		vaultSub   = flag.String("vault-folder", "ServerBrain", "folder inside the vault that ServerBrain manages")
+		timezone   = flag.String("timezone", "Europe/Berlin", "time zone for the server diary")
 	)
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -43,7 +49,13 @@ func main() {
 		return
 	}
 
-	if err := run(log, *addr, *dbPath, *policyFile, *certFile, *keyFile, *clientCA, *interval, *trustProxy); err != nil {
+	loc, err := time.LoadLocation(*timezone)
+	if err != nil {
+		log.Error("invalid -timezone", "err", err)
+		os.Exit(2)
+	}
+	vault := vaultOptions{dir: *vaultDir, folder: *vaultSub, loc: loc}
+	if err := run(log, *addr, *dbPath, *policyFile, *certFile, *keyFile, *clientCA, *interval, *trustProxy, vault); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -65,7 +77,12 @@ func createAdmin(dbPath, name string) error {
 	return nil
 }
 
-func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA string, interval time.Duration, trustProxy bool) error {
+type vaultOptions struct {
+	dir, folder string
+	loc         *time.Location
+}
+
+func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA string, interval time.Duration, trustProxy bool, vo vaultOptions) error {
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return err
@@ -95,6 +112,16 @@ func run(log *slog.Logger, addr, dbPath, policyFile, certFile, keyFile, clientCA
 
 	srv := server.New(server.Config{HeartbeatInterval: interval, RequireClientCert: clientCA != "", TrustProxy: trustProxy}, st, pol, log)
 	go srv.Run(ctx)
+
+	if vo.dir != "" {
+		if err := os.MkdirAll(vo.dir, 0o755); err != nil {
+			return fmt.Errorf("vault: %w", err)
+		}
+		v := knowledge.NewVault(vo.dir, vo.folder, vo.loc, st, log)
+		srv.SetVault(v)
+		go v.Run(ctx)
+		log.Info("Obsidian vault enabled", "path", filepath.Join(vo.dir, vo.folder))
+	}
 
 	hs := &http.Server{
 		Addr:              addr,
